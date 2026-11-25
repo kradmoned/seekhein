@@ -1,0 +1,9 @@
+.DS_Store
+bin/
+/runner
+.env
+*.test
+coverage.out
+__pycache__/
+*.pyc
+.pytest_cache/
