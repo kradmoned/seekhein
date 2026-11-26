@@ -50,9 +50,8 @@ const (
 // TestResult holds full server-side execution details for a single test case.
 type TestResult struct {
 	Index           int          `json:"index"`        // 1-based test order
-	Name            string       `json:"name"`         // raw function/method name (e.g. "test_empty_list")
-	DisplayName     string       `json:"display_name"` // docstring first line or humanized Name
-	Hidden          bool         `json:"hidden"`       // true when Name starts with "test_hidden_"
+	Name            string       `json:"name"`         // method name (e.g. "test_empty_list" or "test_cases[1]")
+	DisplayName     string       `json:"display_name"` // docstring first line, subTest msg, or humanized Name
 	Status          TestStatus   `json:"status"`       // "passed", "failed", "timeout", "not_run"
 	Passed          bool         `json:"passed"`
 	Inputs          string       `json:"inputs,omitempty"`
@@ -67,7 +66,6 @@ type TestResult struct {
 	Detail          string       `json:"-"` // internal-only raw traceback/assertion snippet; never serialized to student
 
 	hasDocstring bool
-	usedExpect   bool
 }
 
 // RunResult holds the full internal result returned by Runner.Run.
@@ -91,7 +89,6 @@ type StudentTestResult struct {
 	Index           int          `json:"index"`
 	Name            string       `json:"name"`
 	DisplayName     string       `json:"display_name"`
-	Hidden          bool         `json:"hidden"`
 	Status          TestStatus   `json:"status"`
 	Passed          bool         `json:"passed"`
 	Inputs          string       `json:"inputs,omitempty"`
@@ -121,9 +118,9 @@ type StudentRunResult struct {
 }
 
 // ToStudentView converts a RunResult into a leak-safe StudentRunResult.
-// For standard tests it preserves Boot.dev learning diagnostics; for test_hidden_*
-// tests it strips Inputs, Expected, Actual, and assertion ErrorMessage, and always
-// suppresses internal Detail/InternalError and non-solution syntax errors.
+// All tests preserve Boot.dev learning diagnostics (Inputs, Expected, Actual,
+// ErrorMessage, solution.py-only Traceback, and per-test Stdout), while
+// internal Detail, InternalError, and non-solution syntax errors are stripped.
 func (r *RunResult) ToStudentView() StudentRunResult {
 	if r == nil {
 		return StudentRunResult{
@@ -156,28 +153,22 @@ func (r *RunResult) ToStudentView() StudentRunResult {
 	}
 
 	for _, t := range r.Tests {
-		st := StudentTestResult{
+		out.Tests = append(out.Tests, StudentTestResult{
 			Index:           t.Index,
 			Name:            t.Name,
 			DisplayName:     t.DisplayName,
-			Hidden:          t.Hidden,
 			Status:          t.Status,
 			Passed:          t.Passed,
+			Inputs:          t.Inputs,
+			Expected:        t.Expected,
+			Actual:          t.Actual,
 			ErrorType:       t.ErrorType,
+			ErrorMessage:    t.ErrorMessage,
 			Traceback:       cloneTraceFrames(t.Traceback),
 			Stdout:          t.Stdout,
 			StdoutTruncated: t.StdoutTruncated,
 			DurationMs:      t.DurationMs,
-		}
-		if !t.Hidden {
-			st.Inputs = t.Inputs
-			st.Expected = t.Expected
-			st.Actual = t.Actual
-			st.ErrorMessage = t.ErrorMessage
-		} else if t.ErrorType != "" && t.ErrorType != "AssertionError" {
-			st.ErrorMessage = t.ErrorMessage
-		}
-		out.Tests = append(out.Tests, st)
+		})
 	}
 
 	return out
@@ -192,12 +183,11 @@ type TutorSyntaxError struct {
 	CodeLine     string `json:"code_line,omitempty"`
 }
 
-// TutorTestFailure gives the AI tutor full failure diagnostics, including hidden tests.
+// TutorTestFailure gives the AI tutor full failure diagnostics for each failing test.
 type TutorTestFailure struct {
 	Index        int          `json:"index"`
 	Name         string       `json:"name"`
 	DisplayName  string       `json:"display_name"`
-	Hidden       bool         `json:"hidden"`
 	Status       TestStatus   `json:"status"` // "failed" or "timeout"
 	Inputs       string       `json:"inputs,omitempty"`
 	Expected     string       `json:"expected,omitempty"`
@@ -269,7 +259,6 @@ func (r *RunResult) ToTutorContext() TutorRunContext {
 			Index:        t.Index,
 			Name:         t.Name,
 			DisplayName:  t.DisplayName,
-			Hidden:       t.Hidden,
 			Status:       t.Status,
 			Inputs:       t.Inputs,
 			Expected:     t.Expected,
@@ -300,7 +289,6 @@ type TeacherTestDiagnostic struct {
 	Index         int        `json:"index"`
 	Name          string     `json:"name"`
 	DisplayName   string     `json:"display_name"`
-	Hidden        bool       `json:"hidden"`
 	Status        TestStatus `json:"status"`
 	Passed        bool       `json:"passed"`
 	Inputs        string     `json:"inputs,omitempty"`
@@ -315,20 +303,18 @@ type TeacherTestDiagnostic struct {
 
 // ValidationResult is returned by Runner.ValidateLab when a teacher uploads a lab.
 type ValidationResult struct {
-	Valid         bool                    `json:"valid"`
-	Summary       string                  `json:"summary"`
-	Status        RunStatus               `json:"status"`
-	DurationMs    int64                   `json:"duration_ms"`
-	TotalTests    int                     `json:"total_tests"`
-	RanTests      int                     `json:"ran_tests"`
-	PassedTests   int                     `json:"passed_tests"`
-	FailedTests   int                     `json:"failed_tests"`
-	StandardTests int                     `json:"standard_tests"`
-	HiddenTests   int                     `json:"hidden_tests"`
-	SyntaxError   *TeacherSyntaxError     `json:"syntax_error,omitempty"`
-	Stdout        string                  `json:"stdout,omitempty"`
-	Tests         []TeacherTestDiagnostic `json:"tests"`
-	Warnings      []string                `json:"warnings,omitempty"`
+	Valid       bool                    `json:"valid"`
+	Summary     string                  `json:"summary"`
+	Status      RunStatus               `json:"status"`
+	DurationMs  int64                   `json:"duration_ms"`
+	TotalTests  int                     `json:"total_tests"`
+	RanTests    int                     `json:"ran_tests"`
+	PassedTests int                     `json:"passed_tests"`
+	FailedTests int                     `json:"failed_tests"`
+	SyntaxError *TeacherSyntaxError     `json:"syntax_error,omitempty"`
+	Stdout      string                  `json:"stdout,omitempty"`
+	Tests       []TeacherTestDiagnostic `json:"tests"`
+	Warnings    []string                `json:"warnings,omitempty"`
 }
 
 func cloneTraceFrames(in []TraceFrame) []TraceFrame {

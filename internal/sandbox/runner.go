@@ -375,15 +375,15 @@ func (r *runner) ValidateLab(ctx context.Context, solutionCode, testCode string)
 
 	slowThresholdMs := r.cfg.PerTestTimeout.Milliseconds() / 2
 	var slowTests []string
-	var unlabeledStandard []string
+	var unlabeledTests []string
+	seenUnlabeled := make(map[string]struct{})
 
 	for _, t := range res.Tests {
-		if t.Hidden {
-			vr.HiddenTests++
-		} else {
-			vr.StandardTests++
-			if !t.hasDocstring && !t.usedExpect {
-				unlabeledStandard = append(unlabeledStandard, t.Name)
+		if !t.hasDocstring {
+			baseName := baseMethodName(t.Name)
+			if _, ok := seenUnlabeled[baseName]; !ok {
+				seenUnlabeled[baseName] = struct{}{}
+				unlabeledTests = append(unlabeledTests, baseName)
 			}
 		}
 		if slowThresholdMs > 0 && t.DurationMs > slowThresholdMs {
@@ -394,7 +394,6 @@ func (r *runner) ValidateLab(ctx context.Context, solutionCode, testCode string)
 			Index:         t.Index,
 			Name:          t.Name,
 			DisplayName:   t.DisplayName,
-			Hidden:        t.Hidden,
 			Status:        t.Status,
 			Passed:        t.Passed,
 			Inputs:        t.Inputs,
@@ -420,7 +419,7 @@ func (r *runner) ValidateLab(ctx context.Context, solutionCode, testCode string)
 		}
 	case res.Total < 1:
 		vr.Valid = false
-		vr.Summary = "lab must define at least 1 test"
+		vr.Summary = "lab must define at least 1 unittest.TestCase test method"
 	case res.Passed != res.Total:
 		vr.Valid = false
 		vr.Summary = fmt.Sprintf("%d of %d tests failed against reference solution", res.Failed, res.Total)
@@ -432,14 +431,18 @@ func (r *runner) ValidateLab(ctx context.Context, solutionCode, testCode string)
 	if len(slowTests) > 0 {
 		vr.Warnings = append(vr.Warnings, fmt.Sprintf("slow reference test(s) exceeding 50%% of %s timeout: %s", r.cfg.PerTestTimeout, strings.Join(slowTests, ", ")))
 	}
-	if vr.TotalTests > 0 && vr.StandardTests == 0 {
-		vr.Warnings = append(vr.Warnings, "all tests are prefixed test_hidden_; students will not see Inputs/Expecting/Actual feedback")
-	}
-	if len(unlabeledStandard) > 0 {
-		vr.Warnings = append(vr.Warnings, fmt.Sprintf("standard test(s) lack both a docstring label and expect(...) call: %s", strings.Join(unlabeledStandard, ", ")))
+	if len(unlabeledTests) > 0 {
+		vr.Warnings = append(vr.Warnings, fmt.Sprintf("test method(s) lack a docstring label: %s", strings.Join(unlabeledTests, ", ")))
 	}
 
 	return vr, nil
+}
+
+func baseMethodName(name string) string {
+	if idx := strings.IndexByte(name, '['); idx >= 0 {
+		return name[:idx]
+	}
+	return name
 }
 
 func firstLine(s string) string {
@@ -462,7 +465,6 @@ type harnessTestResultWire struct {
 	Index           int          `json:"index"`
 	Name            string       `json:"name"`
 	DisplayName     string       `json:"display_name"`
-	Hidden          bool         `json:"hidden"`
 	Status          TestStatus   `json:"status"`
 	Passed          bool         `json:"passed"`
 	Inputs          string       `json:"inputs"`
@@ -476,7 +478,6 @@ type harnessTestResultWire struct {
 	DurationMs      int64        `json:"duration_ms"`
 	Detail          string       `json:"detail"`
 	HasDocstring    bool         `json:"has_docstring"`
-	UsedExpect      bool         `json:"used_expect"`
 }
 
 type harnessOutputWire struct {
@@ -538,7 +539,6 @@ func parseHarnessOutput(raw []byte) (*RunResult, error) {
 			Index:           t.Index,
 			Name:            t.Name,
 			DisplayName:     t.DisplayName,
-			Hidden:          t.Hidden,
 			Status:          t.Status,
 			Passed:          t.Passed,
 			Inputs:          t.Inputs,
@@ -552,7 +552,6 @@ func parseHarnessOutput(raw []byte) (*RunResult, error) {
 			DurationMs:      t.DurationMs,
 			Detail:          t.Detail,
 			hasDocstring:    t.HasDocstring,
-			usedExpect:      t.UsedExpect,
 		})
 	}
 	return res, nil

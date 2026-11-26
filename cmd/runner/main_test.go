@@ -56,9 +56,8 @@ func TestRunEndpointViewsAndErrors(t *testing.T) {
 		Tests: []sandbox.TestResult{
 			{
 				Index:       1,
-				Name:        "test_visible",
-				DisplayName: "Visible test",
-				Hidden:      false,
+				Name:        "test_basic",
+				DisplayName: "Basic test",
 				Status:      sandbox.TestPassed,
 				Passed:      true,
 				Inputs:      "x=1",
@@ -67,16 +66,15 @@ func TestRunEndpointViewsAndErrors(t *testing.T) {
 			},
 			{
 				Index:        2,
-				Name:         "test_hidden_edge",
-				DisplayName:  "Hidden edge",
-				Hidden:       true,
+				Name:         "test_edge",
+				DisplayName:  "Edge case",
 				Status:       sandbox.TestFailed,
 				Passed:       false,
 				Inputs:       "x=99",
 				Expected:     "100",
 				Actual:       "0",
 				ErrorType:    "AssertionError",
-				ErrorMessage: "expected 100, got 0",
+				ErrorMessage: "0 != 100",
 				Detail:       "secret traceback",
 			},
 		},
@@ -88,19 +86,22 @@ func TestRunEndpointViewsAndErrors(t *testing.T) {
 		},
 	})
 
-	// Default student view strips hidden inputs/expected/actual/detail.
-	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(`{"code":"def f(x): return x","tests":"def test_a(): pass"}`))
+	// Default student view preserves Boot.dev learning fields while stripping internal Detail.
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(`{"code":"def f(x): return x","tests":"import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass"}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if bytes.Contains(rec.Body.Bytes(), []byte("x=99")) || bytes.Contains(rec.Body.Bytes(), []byte("secret traceback")) {
-		t.Fatalf("student view leaked hidden test details: %s", rec.Body.String())
+	if !bytes.Contains(rec.Body.Bytes(), []byte("x=99")) || !bytes.Contains(rec.Body.Bytes(), []byte("0 != 100")) {
+		t.Fatalf("student view missing Boot.dev learning diagnostics: %s", rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("secret traceback")) {
+		t.Fatalf("student view leaked internal Detail: %s", rec.Body.String())
 	}
 
-	// Tutor view preserves full failure diagnostics.
-	reqTutor := httptest.NewRequest(http.MethodPost, "/run?view=tutor", bytes.NewBufferString(`{"code":"def f(x): return x","tests":"def test_a(): pass"}`))
+	// Tutor view preserves full failure diagnostics including Detail.
+	reqTutor := httptest.NewRequest(http.MethodPost, "/run?view=tutor", bytes.NewBufferString(`{"code":"def f(x): return x","tests":"import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass"}`))
 	recTutor := httptest.NewRecorder()
 	h.ServeHTTP(recTutor, reqTutor)
 	if recTutor.Code != http.StatusOK {

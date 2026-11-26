@@ -300,7 +300,6 @@ func TestRunHardeningAndStdcopy(t *testing.T) {
 					Expected:     "3",
 					Actual:       "3",
 					HasDocstring: true,
-					UsedExpect:   true,
 				},
 			},
 		})
@@ -479,32 +478,37 @@ func TestViewsAndValidateLabWarnings(t *testing.T) {
 		out, _ := json.Marshal(harnessOutputWire{
 			Status: StatusOK,
 			Score:  100,
-			Ran:    2,
-			Passed: 2,
+			Ran:    3,
+			Passed: 3,
 			Failed: 0,
-			Total:  2,
+			Total:  3,
 			Tests: []harnessTestResultWire{
 				{
 					Index:        1,
-					Name:         "test_hidden_a",
-					DisplayName:  "Hidden a",
-					Hidden:       true,
+					Name:         "test_slow_cases[1]",
+					DisplayName:  "Slow cases (case 1/2)",
 					Status:       TestPassed,
 					Passed:       true,
 					DurationMs:   1500,
 					HasDocstring: false,
-					UsedExpect:   false,
 				},
 				{
 					Index:        2,
-					Name:         "test_hidden_b",
-					DisplayName:  "Hidden b",
-					Hidden:       true,
+					Name:         "test_slow_cases[2]",
+					DisplayName:  "Slow cases (case 2/2)",
 					Status:       TestPassed,
 					Passed:       true,
 					DurationMs:   10,
+					HasDocstring: false,
+				},
+				{
+					Index:        3,
+					Name:         "test_fast_labeled",
+					DisplayName:  "Fast labeled test",
+					Status:       TestPassed,
+					Passed:       true,
+					DurationMs:   5,
 					HasDocstring: true,
-					UsedExpect:   true,
 				},
 			},
 		})
@@ -515,48 +519,39 @@ func TestViewsAndValidateLabWarnings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRunnerWithClient: %v", err)
 	}
-	vr, err := r.ValidateLab(context.Background(), "def f(): return 1", "def test_hidden_a(): pass")
+	vr, err := r.ValidateLab(context.Background(), "def f(): return 1", "import unittest\nclass T(unittest.TestCase):\n    def test_slow_cases(self): pass")
 	if err != nil {
 		t.Fatalf("ValidateLab: %v", err)
 	}
-	if !vr.Valid || vr.HiddenTests != 2 || vr.StandardTests != 0 {
+	if !vr.Valid || vr.TotalTests != 3 || vr.PassedTests != 3 {
 		t.Fatalf("unexpected ValidationResult: %+v", vr)
 	}
 	if len(vr.Warnings) != 2 {
-		t.Fatalf("expected 2 warnings (slow test + all hidden), got %v", vr.Warnings)
+		t.Fatalf("expected 2 warnings (slow test + unlabeled method), got %v", vr.Warnings)
+	}
+	if !strings.Contains(vr.Warnings[1], "test_slow_cases") || strings.Contains(vr.Warnings[1], "test_slow_cases[1]") {
+		t.Fatalf("expected deduplicated unlabeled method warning for test_slow_cases, got %q", vr.Warnings[1])
 	}
 
-	// Verify unlabeled standard test warning.
+	// Verify 0-test rejection message.
 	cli.onStart = func(_ context.Context, _ string, _ []byte) ([]byte, []byte, int64, bool, error) {
 		out, _ := json.Marshal(harnessOutputWire{
 			Status: StatusOK,
-			Score:  100,
-			Ran:    1,
-			Passed: 1,
+			Score:  0,
+			Ran:    0,
+			Passed: 0,
 			Failed: 0,
-			Total:  1,
-			Tests: []harnessTestResultWire{
-				{
-					Index:        1,
-					Name:         "test_plain",
-					DisplayName:  "Plain",
-					Hidden:       false,
-					Status:       TestPassed,
-					Passed:       true,
-					DurationMs:   5,
-					HasDocstring: false,
-					UsedExpect:   false,
-				},
-			},
+			Total:  0,
+			Tests:  []harnessTestResultWire{},
 		})
 		return out, nil, 0, false, nil
 	}
-	vr2, err := r.ValidateLab(context.Background(), "def f(): return 1", "def test_plain(): assert f() == 1")
+	vrZero, err := r.ValidateLab(context.Background(), "def f(): return 1", "def test_top_level(): assert True")
 	if err != nil {
-		t.Fatalf("ValidateLab 2: %v", err)
+		t.Fatalf("ValidateLab zero: %v", err)
 	}
-	if len(vr2.Warnings) != 1 || !strings.Contains(vr2.Warnings[0], "test_plain") {
-		t.Fatalf("expected unlabeled standard test warning, got %v", vr2.Warnings)
+	if vrZero.Valid || !strings.Contains(vrZero.Summary, "unittest.TestCase") {
+		t.Fatalf("expected unittest.TestCase rejection for 0-test suite, got %+v", vrZero)
 	}
 }
 
@@ -605,46 +600,70 @@ func runLocalPythonHarness(t *testing.T, code, tests string, perTestTimeoutSec f
 	return res
 }
 
-func TestHarnessHappyPathAndTestStyles(t *testing.T) {
+func TestHarnessUnittestAssertionsAndLifecycle(t *testing.T) {
 	code := `
 def add(a, b):
     return a + b
+
+def invert(d):
+    return {v: k for k, v in d.items()}
+
+def divide(a, b):
+    if b == 0:
+        raise ValueError("cannot divide by zero")
+    return a / b
 `
 	tests := `
 import unittest
-from solution import add
+from solution import add, invert, divide
 
-def test_expect_style():
-    """Adds positive integers"""
-    expect(add(2, 3), 5, inputs={"a": 2, "b": 3})
+class TestMathAndDict(unittest.TestCase):
+    events = []
 
-def test_plain_assert():
-    assert add(-1, 1) == 0
+    @classmethod
+    def setUpClass(cls):
+        cls.base = 10
 
-class TestAddCases(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls):
+        cls.events.append("tearDownClass")
+
     def setUp(self):
-        self.base = 10
+        self.cleanups = []
+        self.addCleanup(lambda: self.cleanups.append("cleaned"))
 
-    def test_unittest_case(self):
+    def test_add_with_setup(self):
         """Adds against setup base"""
         self.assertEqual(add(self.base, 5), 15)
+
+    def test_invert_dict(self):
+        """Inverts dictionary keys and values"""
+        self.assertDictEqual(invert({"a": 1, "b": 2}), {1: "a", 2: "b"})
+
+    def test_almost_equal(self):
+        self.assertAlmostEqual(divide(1, 3), 0.333333, places=5)
+
+    def test_raises(self):
+        """Raises ValueError when dividing by zero"""
+        with self.assertRaises(ValueError):
+            divide(10, 0)
 `
 	res := runLocalPythonHarness(t, code, tests, 2.0)
-	if res.Status != StatusOK || res.Score != 100 || res.Ran != 3 || res.Passed != 3 || res.Failed != 0 || res.Total != 3 {
+	if res.Status != StatusOK || res.Score != 100 || res.Ran != 4 || res.Passed != 4 || res.Failed != 0 || res.Total != 4 {
 		t.Fatalf("unexpected happy path result: %+v", res)
 	}
-	if res.Tests[0].DisplayName != "Adds positive integers" || res.Tests[0].Inputs != "a=2, b=3" || res.Tests[0].Expected != "5" || res.Tests[0].Actual != "5" {
-		t.Fatalf("unexpected first test metadata: %+v", res.Tests[0])
+	if res.Tests[0].DisplayName != "Adds against setup base" || res.Tests[0].Actual != "15" || res.Tests[0].Expected != "15" {
+		t.Fatalf("unexpected assertEqual capture: %+v", res.Tests[0])
 	}
-	if res.Tests[1].DisplayName != "Plain assert" {
-		t.Fatalf("expected humanized fallback display name, got %q", res.Tests[1].DisplayName)
+	if res.Tests[1].Actual != "{1: 'a', 2: 'b'}" || res.Tests[1].Expected != "{1: 'a', 2: 'b'}" {
+		t.Fatalf("unexpected assertDictEqual capture: %+v", res.Tests[1])
 	}
-	if res.Tests[2].DisplayName != "Adds against setup base" {
-		t.Fatalf("expected unittest docstring display name, got %q", res.Tests[2].DisplayName)
+	if res.Tests[2].DisplayName != "Almost equal" {
+		t.Fatalf("expected humanized fallback display name, got %q", res.Tests[2].DisplayName)
 	}
 }
 
-func TestHarnessBootDevDiagnosticsAndHiddenLeakPrevention(t *testing.T) {
+func TestHarnessSubTestExpansionAndBootDevDiagnostics(t *testing.T) {
 	code := `
 def two_sum(nums, target):
     print(f"checking nums={nums}")
@@ -654,79 +673,73 @@ def two_sum(nums, target):
     return [0, 1]
 `
 	tests := `
+import unittest
 from solution import two_sum
 
-def test_basic_pair():
-    """Finds matching pair in basic list"""
-    expect(two_sum([2, 7, 11, 15], 9), [0, 1], inputs="nums=[2, 7, 11, 15], target=9")
+class TestTwoSum(unittest.TestCase):
+    def test_examples(self):
+        """Finds two indices summing to target"""
+        cases = [
+            ("basic pair", [2, 7, 11, 15], 9, [0, 1]),
+            ("empty list", [], 5, []),
+            ("duplicate values", [3, 3], 6, [0, 1]),
+        ]
+        for label, nums, target, expected in cases:
+            with self.subTest(msg=label, nums=nums, target=target):
+                self.assertEqual(two_sum(nums, target), expected)
 
-def test_empty_list():
-    """Returns empty list on empty input"""
-    record_inputs("nums=[], target=5")
-    expect(two_sum([], 5), [])
-
-def test_duplicate_elements():
-    """Does not reuse the same index twice"""
-    expect(two_sum([3, 3], 6), [0, 1], inputs="nums=[3, 3], target=6")
-
-def test_hidden_secret_case():
-    """Handles hidden edge cases"""
-    expect(two_sum([99, 1], 100), [1, 0], inputs="nums=[99, 1], target=100")
+    def test_single_subtest(self):
+        """Handles negative numbers"""
+        with self.subTest(nums=[-3, 4, 3, 90], target=0):
+            self.assertEqual(two_sum([-3, 4, 3, 90], 0), [0, 1])
 `
 	res := runLocalPythonHarness(t, code, tests, 2.0)
-	if res.Status != StatusOK || res.Ran != 4 || res.Passed != 1 || res.Failed != 3 || res.Score != 25 {
-		t.Fatalf("unexpected run summary: %+v", res)
+	if res.Status != StatusOK || res.Ran != 4 || res.Passed != 2 || res.Failed != 2 || res.Total != 4 || res.Score != 50 {
+		t.Fatalf("unexpected subTest expansion summary: %+v", res)
 	}
 
-	// Verify student view keeps Boot.dev details on standard tests and strips hidden test secrets.
+	// Verify student view preserves full Boot.dev details without leaking <test_suite> frames or Detail.
 	sv := res.ToStudentView()
 	svJSON, err := json.Marshal(sv)
 	if err != nil {
 		t.Fatalf("marshal StudentRunResult: %v", err)
 	}
 	svStr := string(svJSON)
-	if strings.Contains(svStr, "<hidden_test>") {
-		t.Fatalf("student view leaked <hidden_test> frame: %s", svStr)
-	}
-	if strings.Contains(svStr, "target=100") || strings.Contains(svStr, "[1, 0]") || strings.Contains(svStr, "expected [1, 0]") {
-		t.Fatalf("student view leaked hidden test inputs/expected/actual: %s", svStr)
+	if strings.Contains(svStr, "<test_suite>") {
+		t.Fatalf("student view leaked <test_suite> frame: %s", svStr)
 	}
 
-	// Standard failing runtime crash has filtered solution.py traceback & per-test stdout.
+	// Expanded subTests: basic pair (pass), empty list (IndexError + filtered solution.py traceback), duplicate values (Expecting/Actual).
+	if sv.Tests[0].Name != "test_examples[1]" || sv.Tests[0].DisplayName != "basic pair" || !sv.Tests[0].Passed {
+		t.Fatalf("unexpected first expanded subTest: %+v", sv.Tests[0])
+	}
 	emptyCase := sv.Tests[1]
-	if emptyCase.ErrorType != "IndexError" || emptyCase.Stdout != "checking nums=[]\n" || len(emptyCase.Traceback) != 1 || emptyCase.Traceback[0].Line != 4 {
+	if emptyCase.Name != "test_examples[2]" || emptyCase.Inputs != "nums=[], target=5" || emptyCase.ErrorType != "IndexError" || emptyCase.Stdout != "checking nums=[]\n" || len(emptyCase.Traceback) != 1 || emptyCase.Traceback[0].Line != 4 {
 		t.Fatalf("unexpected filtered traceback/stdout for empty case: %+v", emptyCase)
 	}
-
-	// Standard failing assertion has Inputs/Expecting/Actual.
 	dupCase := sv.Tests[2]
-	if dupCase.Inputs != "nums=[3, 3], target=6" || dupCase.Expected != "[0, 1]" || dupCase.Actual != "[0, 0]" {
+	if dupCase.Inputs != "nums=[3, 3], target=6" || dupCase.Expected != "[0, 1]" || dupCase.Actual != "[0, 0]" || dupCase.ErrorType != "AssertionError" {
 		t.Fatalf("unexpected Boot.dev assertion fields: %+v", dupCase)
 	}
-
-	// Hidden failing test omits Inputs/Expected/Actual/AssertionError message.
-	hiddenCase := sv.Tests[3]
-	if !hiddenCase.Hidden || hiddenCase.Inputs != "" || hiddenCase.Expected != "" || hiddenCase.Actual != "" || hiddenCase.ErrorMessage != "" {
-		t.Fatalf("hidden test leaked disallowed fields in student view: %+v", hiddenCase)
+	// Single subTest stays 1 entry keeping method name and docstring.
+	singleCase := sv.Tests[3]
+	if singleCase.Name != "test_single_subtest" || singleCase.DisplayName != "Handles negative numbers" || singleCase.Inputs != "nums=[-3, 4, 3, 90], target=0" {
+		t.Fatalf("unexpected single subTest shape: %+v", singleCase)
 	}
 
-	// Tutor context keeps everything, including passed tests and hidden test details.
+	// Tutor context keeps passed tests and full raw traceback detail.
 	tc := res.ToTutorContext()
-	if len(tc.PassedTests) != 1 || tc.PassedTests[0] != "test_basic_pair" {
+	if len(tc.PassedTests) != 2 || tc.PassedTests[0] != "test_examples[1]" {
 		t.Fatalf("unexpected PassedTests in TutorRunContext: %+v", tc.PassedTests)
 	}
-	if len(tc.Failures) != 3 {
-		t.Fatalf("expected all 3 failures in TutorRunContext, got %d", len(tc.Failures))
-	}
-	hiddenTutor := tc.Failures[2]
-	if hiddenTutor.Inputs != "nums=[99, 1], target=100" || hiddenTutor.Expected != "[1, 0]" || hiddenTutor.Detail == "" {
-		t.Fatalf("expected full hidden test context in TutorRunContext, got %+v", hiddenTutor)
+	if len(tc.Failures) != 2 || tc.Failures[0].Detail == "" || !strings.Contains(tc.Failures[0].Detail, "<test_suite>") {
+		t.Fatalf("expected full raw traceback in TutorRunContext failures: %+v", tc.Failures)
 	}
 }
 
 func TestHarnessSyntaxImportTimeoutAndAdversarial(t *testing.T) {
 	t.Run("syntax error in solution vs tests", func(t *testing.T) {
-		resSol := runLocalPythonHarness(t, "def f(\n    return 1", "def test_a(): pass", 2.0)
+		resSol := runLocalPythonHarness(t, "def f(\n    return 1", "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass", 2.0)
 		if resSol.Status != StatusSyntaxError || resSol.SyntaxError == nil || resSol.SyntaxError.Source != "solution" || resSol.SyntaxError.Line != 1 {
 			t.Fatalf("unexpected solution syntax error: %+v", resSol)
 		}
@@ -734,7 +747,7 @@ func TestHarnessSyntaxImportTimeoutAndAdversarial(t *testing.T) {
 			t.Fatalf("student view should keep solution syntax error line: %+v", sv)
 		}
 
-		resTest := runLocalPythonHarness(t, "def f(): return 1", "def test_a(:\n    pass", 2.0)
+		resTest := runLocalPythonHarness(t, "def f(): return 1", "import unittest\nclass T(unittest.TestCase):\n    def test_a(self:\n        pass", 2.0)
 		if resTest.Status != StatusSyntaxError || resTest.SyntaxError == nil || resTest.SyntaxError.Source != "tests" {
 			t.Fatalf("unexpected test syntax error: %+v", resTest)
 		}
@@ -744,13 +757,31 @@ func TestHarnessSyntaxImportTimeoutAndAdversarial(t *testing.T) {
 	})
 
 	t.Run("missing symbol triggers StatusRuntimeError", func(t *testing.T) {
-		res := runLocalPythonHarness(t, "def wrong_name(): return 1", "from solution import missing_fn\ndef test_a(): pass", 2.0)
+		res := runLocalPythonHarness(t, "def wrong_name(): return 1", "import unittest\nfrom solution import missing_fn\nclass T(unittest.TestCase):\n    def test_a(self): pass", 2.0)
 		if res.Status != StatusRuntimeError || res.Score != 0 || !strings.Contains(res.InternalError, "ImportError") {
 			t.Fatalf("unexpected runtime error result: %+v", res)
 		}
 	})
 
-	t.Run("per-test timeout continues to remaining tests", func(t *testing.T) {
+	t.Run("setUpClass failure fails class methods cleanly", func(t *testing.T) {
+		tests := `
+import unittest
+class T(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        raise RuntimeError("boom in setup")
+    def test_one(self):
+        self.assertEqual(1, 1)
+    def test_two(self):
+        self.assertEqual(2, 2)
+`
+		res := runLocalPythonHarness(t, "x = 1", tests, 2.0)
+		if res.Status != StatusOK || res.Total != 2 || res.Failed != 2 || res.Tests[0].ErrorType != "RuntimeError" {
+			t.Fatalf("expected both methods failed from setUpClass error, got %+v", res)
+		}
+	})
+
+	t.Run("per-test and per-subTest timeout continues to remaining cases", func(t *testing.T) {
 		code := `
 def spin():
     while True:
@@ -760,20 +791,24 @@ def ok():
     return 42
 `
 		tests := `
+import unittest
 from solution import spin, ok
 
-def test_infinite():
-    spin()
+class T(unittest.TestCase):
+    def test_subtests_with_timeout(self):
+        for fn in (spin, ok):
+            with self.subTest(fn=fn.__name__):
+                self.assertEqual(fn(), 42)
 
-def test_after_timeout():
-    expect(ok(), 42)
+    def test_after_timeout(self):
+        self.assertEqual(ok(), 42)
 `
 		res := runLocalPythonHarness(t, code, tests, 0.2)
-		if res.Status != StatusOK || res.Ran != 2 || res.Passed != 1 || res.Failed != 1 || res.Score != 50 {
-			t.Fatalf("expected partial credit after per-test timeout, got %+v", res)
+		if res.Status != StatusOK || res.Ran != 3 || res.Passed != 2 || res.Failed != 1 || res.Score != 66 {
+			t.Fatalf("expected 2/3 passing after per-subTest timeout, got %+v", res)
 		}
-		if res.Tests[0].Status != TestTimedOut || res.Tests[0].ErrorType != "TimeoutError" || !res.Tests[1].Passed {
-			t.Fatalf("unexpected per-test timeout breakdown: %+v", res.Tests)
+		if res.Tests[0].Status != TestTimedOut || res.Tests[0].ErrorType != "TimeoutError" || !res.Tests[1].Passed || !res.Tests[2].Passed {
+			t.Fatalf("unexpected per-subTest timeout breakdown: %+v", res.Tests)
 		}
 	})
 
@@ -785,9 +820,11 @@ def cheat():
     return 0
 `
 		testsFail := `
+import unittest
 from solution import cheat
-def test_cheat():
-    expect(cheat(), 1)
+class T(unittest.TestCase):
+    def test_cheat(self):
+        self.assertEqual(cheat(), 1)
 `
 		res := runLocalPythonHarness(t, code, testsFail, 2.0)
 		if res.Status != StatusOK || res.Score != 0 || res.Passed != 0 || res.Failed != 1 {
@@ -798,7 +835,7 @@ def test_cheat():
 		}
 	})
 
-	t.Run("hidden test file never written to disk", func(t *testing.T) {
+	t.Run("test file never written to disk", func(t *testing.T) {
 		code := `
 import os
 
@@ -806,10 +843,11 @@ def scan_dir():
     return sorted(os.listdir(os.path.dirname(__file__)))
 `
 		tests := `
+import unittest
 from solution import scan_dir
-def test_no_test_file():
-    files = scan_dir()
-    assert files == ["solution.py"], f"unexpected files: {files}"
+class T(unittest.TestCase):
+    def test_no_test_file(self):
+        self.assertEqual(scan_dir(), ["solution.py"])
 `
 		res := runLocalPythonHarness(t, code, tests, 2.0)
 		if res.Status != StatusOK || res.Score != 100 {
@@ -817,10 +855,10 @@ def test_no_test_file():
 		}
 	})
 
-	t.Run("zero discovered tests", func(t *testing.T) {
-		res := runLocalPythonHarness(t, "x = 1", "helper = 2", 2.0)
+	t.Run("bare top-level functions ignored (zero unittest.TestCase tests)", func(t *testing.T) {
+		res := runLocalPythonHarness(t, "x = 1", "def test_top_level():\n    assert True", 2.0)
 		if res.Status != StatusOK || res.Total != 0 {
-			t.Fatalf("expected Total=0 for 0-test suite, got %+v", res)
+			t.Fatalf("expected Total=0 when no unittest.TestCase class exists, got %+v", res)
 		}
 	})
 }
@@ -846,7 +884,7 @@ func TestDockerIntegration_ExecutionAndHardening(t *testing.T) {
 	r := requireDockerSandbox(t)
 	ctx := context.Background()
 
-	t.Run("pytest helpers and happy path", func(t *testing.T) {
+	t.Run("stdlib unittest happy path", func(t *testing.T) {
 		res, err := r.Run(ctx, RunRequest{
 			Code: `
 def divide(a, b):
@@ -855,15 +893,16 @@ def divide(a, b):
     return a / b
 `,
 			Tests: `
-import pytest
+import unittest
 from solution import divide
 
-def test_approx():
-    assert divide(1, 3) == pytest.approx(0.333333, rel=1e-4)
+class TestDivide(unittest.TestCase):
+    def test_approx(self):
+        self.assertAlmostEqual(divide(1, 3), 0.333333, places=4)
 
-def test_raises():
-    with pytest.raises(ValueError):
-        divide(1, 0)
+    def test_raises(self):
+        with self.assertRaises(ValueError):
+            divide(1, 0)
 `,
 		})
 		if err != nil {
@@ -877,7 +916,7 @@ def test_raises():
 	t.Run("OOM bomb", func(t *testing.T) {
 		res, err := r.Run(ctx, RunRequest{
 			Code:  "data = bytearray(512 * 1024 * 1024)",
-			Tests: "import solution\ndef test_a(): pass",
+			Tests: "import unittest\nimport solution\nclass T(unittest.TestCase):\n    def test_a(self): pass",
 		})
 		if err != nil {
 			t.Fatalf("Run: %v", err)
@@ -896,13 +935,12 @@ def try_connect():
     s.close()
 `,
 			Tests: `
+import unittest
 from solution import try_connect
-def test_no_net():
-    try:
-        try_connect()
-    except OSError:
-        return
-    raise AssertionError("network should be disabled")
+class T(unittest.TestCase):
+    def test_no_net(self):
+        with self.assertRaises(OSError):
+            try_connect()
 `,
 		})
 		if err != nil {
@@ -921,13 +959,12 @@ def write_root():
         f.write("x")
 `,
 			Tests: `
+import unittest
 from solution import write_root
-def test_ro():
-    try:
-        write_root()
-    except OSError:
-        return
-    raise AssertionError("rootfs should be read-only")
+class T(unittest.TestCase):
+    def test_ro(self):
+        with self.assertRaises(OSError):
+            write_root()
 `,
 		})
 		if err != nil {
