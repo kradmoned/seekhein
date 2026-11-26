@@ -1,6 +1,7 @@
 import { requireUser } from "../../../../lib/auth"
 import { pool } from "../../../../lib/db"
 import { courseAccessSql } from "../../../../lib/courses"
+import { integrityPolicy } from "../../../../lib/integrity"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -55,6 +56,7 @@ export async function GET(
         instructions: lab.instructions,
         starter: lab.starter,
         course_id: lab.course_id,
+        integrity_policy: integrityPolicy,
       },
       { headers: { "Cache-Control": "private, no-store" } },
     )

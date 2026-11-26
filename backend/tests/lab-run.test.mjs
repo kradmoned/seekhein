@@ -35,13 +35,14 @@ function harness(options = {}) {
     if (filename === path.join(root, "lib/auth.ts")) {
       return { requireUser: async (_req, role) => {
         authRoles.push(role)
-        return options.authError ? { error: options.authError } : { user: { id: labId, role: "student" } }
+        return options.authError ? { error: options.authError } : { user: { id: labId, role: options.role ?? "student" } }
       } }
     }
     if (filename === path.join(root, "lib/db.ts")) {
       return { pool: { query: async (sql, values) => {
         queries.push({ sql, values })
         if (options.dbError) throw new Error(secret)
+        if (options.saveError && sql.includes("INSERT INTO public.submissions")) throw new Error(secret)
         return { rows: options.rows ?? [{ tests }] }
       } } }
     }
@@ -105,6 +106,24 @@ test("run uses editor code and full database tests, then returns only safe field
   assert.equal(h.requests[0].headers["X-Internal-Key"], "server-test-key")
   assert.equal(h.requests[0].headers.Authorization, undefined)
   assert.equal(h.requests[0].redirect, "error")
+  assert.match(h.queries[1].sql, /INSERT INTO public.submissions/)
+  assert.equal(h.queries[1].values[1], labId)
+  assert.equal(h.queries[1].values[2], code)
+  assert.doesNotMatch(h.queries[1].values[4], new RegExp(secret))
+})
+
+test("teacher preview runs do not create student submissions", async () => {
+  const h = harness({ role: "teacher" })
+  assert.equal((await h.run()).status, 200)
+  assert.equal(h.queries.length, 1)
+})
+
+test("a failed submission save returns an error after execution", async () => {
+  const h = harness({ saveError: true })
+  const response = await h.run()
+  assert.equal(response.status, 500)
+  assert.doesNotMatch(await response.text(), new RegExp(secret))
+  assert.equal(h.requests.length, 1)
 })
 
 test("authentication runs before parsing, querying, or running code", async () => {

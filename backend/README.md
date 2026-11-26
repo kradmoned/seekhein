@@ -40,8 +40,8 @@ all existing and future labs in the course.
 
 The frontend can select its dashboard using `/api/me` and populate course cards
 using `/api/courses`. Teachers can open a course's roster and upload labs with
-that course's ID. Students can open the course and its labs. Student results
-require submission persistence, which is a future feature.
+that course's ID. Students can open the course and its labs. Teachers can read
+student execution results and integrity activity through the lab report below.
 
 Create a course using a teacher token, then use the returned ID as `COURSE_ID`.
 
@@ -121,9 +121,10 @@ HTTP 200 (example contents):
 {"id":"11111111-1111-4111-8111-111111111111","title":"Addition","instructions":"# Addition\nImplement add(a, b).\n","starter":"def add(a, b):\n    pass\n","course_id":"22222222-2222-4222-8222-222222222222"}
 ```
 
-The current database has no `submissions` table. As a temporary contract,
-`solved` and `last_code` are omitted until submission storage is implemented.
-The frontend can initialize the editor with `starter`.
+Student executions are stored in `submissions`. The lab fetch contract still
+omits `solved` and `last_code`. The frontend can initialize the editor with
+`starter`. Lab detail also includes the backend's `integrity_policy`, documented
+in `docs/frontend-integrity.md`.
 Hidden tests and reference solutions are never returned.
 
 Errors use `{"error":"message"}`:
@@ -226,9 +227,74 @@ class TestAdd(unittest.TestCase):
         self.assertEqual(add(-1, -4), -5)
 ```
 
-Runs are not persisted yet. This feature adds no submissions migration, and
-`solved` / `last_code` remain deferred. The runner's Docker isolation and
-internal-key enforcement must be verified against its deployment separately.
+Processed student runs are saved with submitted code, sanitized results, counts,
+status, and server time before HTTP 200 is returned. Teacher preview executions
+create no student submissions. A storage failure returns HTTP 500 even if
+execution finished. Retrying Run performs a new execution and saves a new
+submission. The runner's Docker isolation and internal-key enforcement must be
+verified against its deployment separately.
+
+## Integrity events and reports
+
+Apply `db/migrations/20261127_001_integrity.sql` once after the course migration.
+It adds `integrity_events` and `submissions`, with triggers rejecting updates,
+deletes, and truncation. Direct browser-role privileges are revoked. Existing
+course and lab content is preserved. No additional environment variables are
+needed. Keep applied migration files immutable.
+
+`POST /api/labs/{id}/events` accepts student telemetry only for enrolled courses.
+It authenticates before reading the body and derives student identity from the
+verified profile. Known events are validated and inserted together. Unknown
+types are dropped. Batches exceeding 100 items or 64 KiB return `400`. Malformed
+JSON, invalid event fields, and invalid lab IDs also return `400`. Incorrect
+content type returns `415`. Inaccessible labs return `404`.
+
+Every event requires UUID `event_id` and `session_id`. Retry the same IDs after
+network failures. A unique key ignores repeated IDs for the same lab/student
+without changing the original event. The backend supplies `received_at` and
+uses it for ordering and scoring. Success returns an empty `204` response.
+
+```bash
+curl -i "http://localhost:3000/api/labs/$LAB_ID/events" \
+  -H "Authorization: Bearer $STUDENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '[{"event_id":"2d588df5-a769-4624-b339-9ea2b68d4594","session_id":"f28fbaf6-a002-416d-980f-06d198002031","type":"paste_blocked","payload":{"chars":340},"ts":"2026-11-27T14:02:11.000Z"}]'
+
+curl "http://localhost:3000/api/labs/$LAB_ID/report" \
+  -H "Authorization: Bearer $TEACHER_TOKEN"
+```
+
+`GET /api/labs/{id}/report` is restricted to the course's teacher. It includes
+enrolled students plus students with historical activity, execution summaries,
+event timelines, and computed integrity scores sorted ascending. Reports omit
+submitted source, hidden tests, and reference solutions. Chat storage is absent,
+so `chat_available` is false. Scores are computed on read and never persisted.
+
+| Rule | Deduction |
+| --- | --- |
+| Blocked paste or drop | 10 per attempt, capped at 40 |
+| Blocked insertion above 80 characters | 15 per attempt, capped at 30 |
+| Visibility or window-focus loss | First three free, then 5 each, capped at 20 |
+| First perfect run within 60 seconds of first received opening event | 20 |
+
+Overlapping blur and hidden events count as one departure within each page
+session. Send both `window_focus` and `tab_visible` when applicable to complete
+the episode. Every flag includes evidence, receipt time, and its actual penalty.
+The score starts at 100 and floors at zero. Missing telemetry is explicitly
+identified and carries no invented deduction. Browser telemetry remains
+client-reported, and delayed delivery affects the fast-pass observation.
+
+The complete frontend contract, Monaco blocking adapter, delivery checklist,
+report shape, and browser acceptance tests are in
+[the frontend integrity guide](docs/frontend-integrity.md).
+
+`npm test` covers scoring, validation, and the run handler. The PostgreSQL suite
+also covers event access, atomic validation, retries, reports, append-only
+triggers, and submission persistence. It rolls back all changes.
+
+```bash
+node --env-file=.env.local --test tests/integration/courses.test.mjs
+```
 
 Run backend checks with `npm test`, `npm run lint`, and
 `npx tsc --noEmit --incremental false`. The tests exercise the real run handler

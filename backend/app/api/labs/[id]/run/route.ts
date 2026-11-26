@@ -69,6 +69,16 @@ export async function POST(
     }
 
     const resultForStudent = await runCode(body.code, lab.tests)
+    if (user.role === "student") {
+      await pool.query(
+        `INSERT INTO public.submissions
+           (lab_id, student_id, code, status, results, score, passed, total)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)`,
+        [id, user.id, body.code, resultForStudent.status,
+          JSON.stringify(resultForStudent.results), resultForStudent.score,
+          resultForStudent.passed, resultForStudent.total],
+      )
+    }
     return Response.json(resultForStudent, {
       headers: { "Cache-Control": "private, no-store" },
     })

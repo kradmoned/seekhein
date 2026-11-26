@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { test } from "node:test"
@@ -75,6 +76,8 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
   const labs = load("app/api/labs/route.ts")
   const labDetail = load("app/api/labs/[id]/route.ts")
   const run = load("app/api/labs/[id]/run/route.ts")
+  const eventsRoute = load("app/api/labs/[id]/events/route.ts")
+  const reportRoute = load("app/api/labs/[id]/report/route.ts")
 
   try {
     await db.query("BEGIN")
@@ -91,6 +94,11 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
       const migration = readFileSync(path.join(root, "db/migrations/20261126_001_courses.sql"), "utf8")
       await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
       assert.equal((await db.query("SELECT count(*)::int AS count FROM public.labs WHERE course_id IS NULL")).rows[0].count, 0)
+    }
+    const integrityExists = (await db.query("SELECT to_regclass('public.integrity_events') AS name")).rows[0].name
+    if (!integrityExists) {
+      const migration = readFileSync(path.join(root, "db/migrations/20261127_001_integrity.sql"), "utf8")
+      await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
     }
 
     await t.test("authentication precedes body parsing and database access", async () => {
@@ -217,6 +225,99 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
       await assert.rejects(db.query("UPDATE public.labs SET teacher_id = $1 WHERE id = $2", [student.id, labId]), { code: "23503" })
       await db.query("ROLLBACK TO SAVEPOINT invalid_owner")
       const grants = await db.query("SELECT grantee FROM information_schema.table_privileges WHERE table_schema = 'public' AND table_name IN ('courses', 'course_enrollments') AND grantee IN ('anon', 'authenticated', 'PUBLIC')")
+      assert.equal(grants.rows.length, 0)
+    })
+
+    const sessionId = randomUUID()
+    const telemetry = (type, payload = {}) => ({ event_id: randomUUID(), session_id: sessionId, type, payload, ts: "2000-01-01T00:00:00.000Z" })
+    currentUser = teacher
+    const integrityUpload = await labs.POST(upload())
+    assert.equal(integrityUpload.status, 201)
+    const integrityLab = (await integrityUpload.json()).id
+    const integrityContext = context(integrityLab)
+
+    await t.test("events and reports enforce roles and course ownership", async () => {
+      currentUser = undefined
+      assert.equal((await eventsRoute.POST(request("/", []), integrityContext)).status, 401)
+      assert.equal((await reportRoute.GET(request("/"), integrityContext)).status, 401)
+      currentUser = otherStudent
+      assert.equal((await eventsRoute.POST(request("/", [telemetry("lab_opened")]), integrityContext)).status, 404)
+      currentUser = student
+      assert.equal((await reportRoute.GET(request("/"), integrityContext)).status, 403)
+      currentUser = otherTeacher
+      assert.equal((await reportRoute.GET(request("/"), integrityContext)).status, 404)
+      currentUser = teacher
+      assert.equal((await eventsRoute.POST(request("/", []), integrityContext)).status, 403)
+      const initial = await (await reportRoute.GET(request("/"), integrityContext)).json()
+      assert.equal(initial.students.find((s) => s.student_id === student.id).integrity.telemetry_status, "missing")
+    })
+
+    await t.test("event batches are atomic, bounded, allowlisted and retry-safe", async () => {
+      currentUser = student
+      const opened = telemetry("lab_opened")
+      const paste = telemetry("paste_blocked", { chars: 300 })
+      const bulk = telemetry("large_insert", { chars: 500 })
+      const batch = [opened, paste, bulk, { type: "unknown_type" }]
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await eventsRoute.POST(request("/", batch), integrityContext)
+        assert.equal(response.status, 204)
+        assert.equal(await response.text(), "")
+      }
+      // Reusing an ID cannot rewrite the original payload.
+      assert.equal((await eventsRoute.POST(request("/", [{ ...paste, payload: { chars: 1 } }]), integrityContext)).status, 204)
+      assert.equal((await eventsRoute.POST(request("/", [telemetry("lab_opened"), { ...paste, event_id: "invalid" }]), integrityContext)).status, 400)
+      assert.equal((await eventsRoute.POST(request("/", [{ ...paste, student_id: otherStudent.id }]), integrityContext)).status, 400)
+      assert.equal((await eventsRoute.POST(request("/", Array(101).fill({ type: "unknown" })), integrityContext)).status, 400)
+      assert.equal((await eventsRoute.POST(request("/", [], "text/plain"), integrityContext)).status, 415)
+      const huge = new Request("http://localhost", { method: "POST", headers: { "Content-Type": "application/json" }, body: " ".repeat(65537) })
+      assert.equal((await eventsRoute.POST(huge, integrityContext)).status, 400)
+      const saved = await db.query("SELECT student_id, type, payload, client_ts, received_at FROM public.integrity_events WHERE lab_id = $1 ORDER BY received_at, id", [integrityLab])
+      assert.equal(saved.rows.length, 3)
+      assert.deepEqual(saved.rows.map((e) => e.type), ["lab_opened", "paste_blocked", "large_insert"])
+      assert.ok(saved.rows.every((e) => e.student_id === student.id))
+      assert.equal(saved.rows[1].payload.chars, 300)
+      assert.ok(saved.rows[0].received_at > saved.rows[0].client_ts)
+    })
+
+    await t.test("reports score server receipt times and server-recorded submissions", async () => {
+      currentUser = student
+      const focus = []
+      for (let i = 0; i < 4; i++) focus.push(telemetry("window_blur"), telemetry("tab_hidden"), telemetry("tab_visible"), telemetry("window_focus"))
+      assert.equal((await eventsRoute.POST(request("/", focus), integrityContext)).status, 204)
+      assert.equal((await run.POST(request("/", { code: "pass" }), integrityContext)).status, 200)
+      currentUser = teacher
+      const response = await reportRoute.GET(request("/"), integrityContext)
+      assert.equal(response.status, 200)
+      assert.equal(response.headers.get("cache-control"), "private, no-store")
+      const report = await response.json()
+      const record = report.students.find((s) => s.student_id === student.id)
+      assert.equal(record.integrity.penalties.paste, 10)
+      assert.equal(record.integrity.penalties.large_insert, 15)
+      assert.equal(record.integrity.penalties.focus, 5)
+      assert.equal(record.integrity.focus_losses, 4)
+      assert.equal(record.submissions.length, 1)
+      assert.ok(record.first_pass_at)
+      assert.equal(record.events.length, 19)
+      assert.equal(report.chat_available, false)
+      assert.equal(report.students[0].student_id, student.id)
+      assert.ok(!JSON.stringify(report).includes("PRIVATE_FIXTURE"))
+      assert.equal("code" in record.submissions[0], false)
+      assert.equal("tests" in report, false)
+      // Teacher previews do not enter the student results table.
+      assert.equal((await run.POST(request("/", { code: "pass" }), integrityContext)).status, 200)
+      const count = await db.query("SELECT count(*)::int AS count FROM public.submissions WHERE lab_id = $1", [integrityLab])
+      assert.equal(count.rows[0].count, 1)
+    })
+
+    await t.test("stored activity is append-only and has no browser grants", async () => {
+      for (const table of ["integrity_events", "submissions"]) {
+        for (const sql of [`UPDATE public.${table} SET student_id = student_id`, `DELETE FROM public.${table}`, `TRUNCATE public.${table}`]) {
+          await db.query("SAVEPOINT activity_mutation")
+          await assert.rejects(db.query(sql), { code: "55000" })
+          await db.query("ROLLBACK TO SAVEPOINT activity_mutation")
+        }
+      }
+      const grants = await db.query("SELECT grantee FROM information_schema.table_privileges WHERE table_schema = 'public' AND table_name IN ('integrity_events', 'submissions') AND grantee IN ('anon', 'authenticated', 'PUBLIC')")
       assert.equal(grants.rows.length, 0)
     })
   } finally {
