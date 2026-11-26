@@ -64,15 +64,14 @@ curl -i http://localhost:3000/api/labs \
   -F "course_id=$COURSE_ID" -F 'title=Addition' \
   -F 'instructions=@demo-lab/instructions.md' \
   -F 'starter=@demo-lab/starter.py' \
-  -F "tests=@$UNITTEST_FILE" \
+  -F 'tests=@demo-lab/tests.py' \
   -F 'solution=@demo-lab/solution.py'
 
 curl "http://localhost:3000/api/courses/$COURSE_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-`UNITTEST_FILE` should point to a compatible complete test file such as the
-example below. The bundled demo test file still uses the older runner format.
+The bundled `demo-lab/tests.py` uses compatible `unittest.TestCase` methods.
 New uploads require exactly one valid `course_id` field and return `422` when
 it is missing or invalid. The teacher must own the selected course.
 
@@ -212,7 +211,7 @@ successfully but exceed the runner's stricter 64 KiB test limit when executed.
 Upload still does not call `/validate` or the runner.
 
 The current CodeRunner requires `unittest.TestCase` methods. Bare functions and
-the old `expect(...)` demo are incompatible. A compatible complete test file is:
+the old `expect(...)` format are incompatible. A compatible complete test file is:
 
 ```python
 import unittest
@@ -234,6 +233,55 @@ Run backend checks with `npm test`, `npm run lint`, and
 `npx tsc --noEmit --incremental false`. The tests exercise the real run handler
 and runner adapter with mocked auth, database, and HTTP boundaries; they do not
 verify the live Docker service.
+
+## Upload and run the new demo
+
+`demo-lab-unittest/` contains four ready-to-upload files for **Sum Positive
+Numbers**: `instructions.md`, `starter.py`, `tests.py`, and `solution.py`.
+The test file contains six discoverable `unittest.TestCase` methods.
+
+From the backend directory, use a teacher access token as `TOKEN` and the ID of
+a course owned by that teacher as `COURSE_ID`:
+
+```bash
+curl -i http://localhost:3000/api/labs \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "course_id=$COURSE_ID" \
+  -F 'title=Sum Positive Numbers' \
+  -F 'instructions=@demo-lab-unittest/instructions.md' \
+  -F 'starter=@demo-lab-unittest/starter.py' \
+  -F 'tests=@demo-lab-unittest/tests.py' \
+  -F 'solution=@demo-lab-unittest/solution.py'
+```
+
+Expected: HTTP `201` with `{"id":"<new-lab-id>"}`. Set `LAB_ID` to that ID.
+The frontend upload form sends the same fields using `FormData`, with the four
+files selected separately; let the browser set the multipart Content-Type.
+
+Open the new lab in the frontend and run the starter. It should discover six
+tests and fail all six (`status: "ok"`, `score: 0`, `passed: 0`, `total: 6`).
+For a passing smoke check, run:
+
+```bash
+curl -i "http://localhost:3000/api/labs/$LAB_ID/run" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"code":"def sum_positive(numbers):\n    return sum(n for n in numbers if n > 0)\n"}'
+```
+
+Expected: HTTP `200`, `status: "ok"`, `score: 100`, `passed: 6`, `total: 6`,
+and six passing entries in `results`. Teachers can run their own labs. To test
+as a student, enroll that student in the course and use their access token.
+The local runner must be running at the origin configured by `RUNNER_URL`.
+
+If you see `This lab has no runnable unittest tests`, the runner discovered
+zero tests in the **stored** test file. Upload only checks the file's text,
+size, and required form fields; it does not execute tests or call `/validate`.
+Retrying identical code will not repair an incompatible test file.
+
+Fixing a local file does not change an already-uploaded lab. Upload the corrected
+four files as a **new lab** and open the new ID. There is currently no lab-update
+endpoint. Existing database labs are not modified by these demo changes.
 
 ## Getting Started
 
