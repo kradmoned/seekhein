@@ -1,10 +1,99 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Courses and enrollment
+
+Apply `db/migrations/20261126_001_courses.sql` once before deploying these routes.
+The migration runs in a transaction, creates `courses` and `course_enrollments`,
+and adds the required `labs.course_id` foreign key. Each existing lab is placed
+in an **Imported labs** course belonging to its teacher. The migration creates
+one such course per teacher who already has labs. Teachers then enroll students
+explicitly. A compound foreign key enforces matching lab and course ownership.
+Reapplying the file fails and rolls back. Keep applied migration files immutable.
+
+All routes require a Supabase bearer token. Database profile roles determine
+access. Teachers see and manage their own courses. Students see enrolled courses
+and their labs. An inaccessible course or lab returns `404`. Teacher-only routes
+return `403` for students. Successful reads use `Cache-Control: private, no-store`.
+
+| Method and route | Request | Response |
+| --- | --- | --- |
+| `POST /api/courses` | JSON `{"title":"Python basics","description":"Week one"}` | `201 {"id":"<uuid>"}` |
+| `GET /api/courses` | — | Array of `{id,title,description,created_at,lab_count}`. Teachers also receive `student_count`. |
+| `GET /api/courses/{id}` | — | `{id,teacher_id,title,description,created_at,labs:[{id,title}]}` |
+| `POST /api/courses/{id}/students` | JSON `{"email":"student@example.com"}` | `200 {course_id,student_id,enrolled_at}` |
+| `GET /api/courses/{id}/students` | — | Owner-only array of `{id,email,full_name,enrolled_at}` |
+| `POST /api/labs` | Existing multipart fields plus `course_id` | `201 {"id":"<uuid>"}` |
+| `GET /api/labs?course_id={id}` | Optional course filter | Accessible labs as `[{id,title,course_id}]` |
+
+Course titles are trimmed and limited to 1–200 characters. Description is optional,
+defaults to an empty string, and is limited to 5000 characters. Course creation
+and enrollment accept JSON bodies up to 16 KiB. Extra JSON fields are rejected.
+These endpoints return `400` for malformed JSON/IDs, `413` for oversized JSON,
+`415` for an incorrect content type, and `422` for invalid fields.
+
+Enrollment requires an existing student profile. Email matching ignores case and
+surrounding whitespace. Repeated enrollment returns the existing membership,
+and a database unique key prevents duplicates during simultaneous requests.
+An unknown email or teacher account returns `422`. Ambiguous duplicate profile
+emails return `409` for administrator correction. Enrollment grants access to
+all existing and future labs in the course.
+
+The frontend can select its dashboard using `/api/me` and populate course cards
+using `/api/courses`. Teachers can open a course's roster and upload labs with
+that course's ID. Students can open the course and its labs. Student results
+require submission persistence, which is a future feature.
+
+Create a course using a teacher token, then use the returned ID as `COURSE_ID`.
+
+```bash
+curl -i http://localhost:3000/api/courses \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"title":"Python basics","description":"Introductory Python labs"}'
+
+curl -i "http://localhost:3000/api/courses/$COURSE_ID/students" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"email":"student@example.com"}'
+
+curl "http://localhost:3000/api/courses/$COURSE_ID/students" \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -i http://localhost:3000/api/labs \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "course_id=$COURSE_ID" -F 'title=Addition' \
+  -F 'instructions=@demo-lab/instructions.md' \
+  -F 'starter=@demo-lab/starter.py' \
+  -F "tests=@$UNITTEST_FILE" \
+  -F 'solution=@demo-lab/solution.py'
+
+curl "http://localhost:3000/api/courses/$COURSE_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+`UNITTEST_FILE` should point to a compatible complete test file such as the
+example below. The bundled demo test file still uses the older runner format.
+New uploads require exactly one valid `course_id` field and return `422` when
+it is missing or invalid. The teacher must own the selected course.
+
+The course feature uses the existing `DATABASE_URL` and `SUPABASE_URL`.
+Run its PostgreSQL integration check explicitly against the development database
+with one teacher and at least two student profiles available.
+
+```bash
+node --env-file=.env.local --test tests/integration/courses.test.mjs
+```
+
+The test executes the real route handlers and SQL with mocked authentication and
+runner boundaries. All writes are rolled back. It also verifies the migration
+when the course tables are absent. `npm test` runs the isolated runner suite.
+
 ## Lab fetch API
 
 Both GET routes require a Supabase access token in `Authorization: Bearer <token>`.
-Students and teachers can read all labs. Responses contain only student-visible
-fields, and successful responses use `Cache-Control: private, no-store`.
+Students can read labs in enrolled courses, and teachers can read labs in their
+own courses. Responses contain student-visible fields, and successful responses
+use `Cache-Control: private, no-store`.
 
 List labs, newest first (an empty database returns `[]`):
 
@@ -16,7 +105,7 @@ curl http://localhost:3000/api/labs \
 HTTP 200:
 
 ```json
-[{"id":"11111111-1111-4111-8111-111111111111","title":"Addition"}]
+[{"id":"11111111-1111-4111-8111-111111111111","title":"Addition","course_id":"22222222-2222-4222-8222-222222222222"}]
 ```
 
 Fetch a lab using an ID returned by the list or upload route:
@@ -29,7 +118,7 @@ curl "http://localhost:3000/api/labs/$LAB_ID" \
 HTTP 200 (example contents):
 
 ```json
-{"id":"11111111-1111-4111-8111-111111111111","title":"Addition","instructions":"# Addition\nImplement add(a, b).\n","starter":"def add(a, b):\n    pass\n"}
+{"id":"11111111-1111-4111-8111-111111111111","title":"Addition","instructions":"# Addition\nImplement add(a, b).\n","starter":"def add(a, b):\n    pass\n","course_id":"22222222-2222-4222-8222-222222222222"}
 ```
 
 The current database has no `submissions` table. As a temporary contract,
@@ -41,17 +130,17 @@ Errors use `{"error":"message"}`:
 
 - Missing or invalid credentials: HTTP 401 (a verified user without a profile gets 403).
 - Invalid lab UUID: HTTP 400, `{"error":"Invalid lab ID"}`.
-- Unknown lab UUID: HTTP 404, `{"error":"Lab not found"}`.
+- Unknown or inaccessible lab UUID: HTTP 404, `{"error":"Lab not found"}`.
 - Database failure: HTTP 500 with a generic error message.
 
 These routes reuse `DATABASE_URL` and `SUPABASE_URL` from `.env.local`.
-No new environment variables or migrations are required.
+Apply the course migration above before using the updated lab routes.
 
 ## Run a lab
 
 `POST /api/labs/{id}/run` requires authentication and accepts only
-`{"code":"Python source from the student's editor"}`. Both students and teachers
-can run a lab. The backend fetches the complete `tests` text from Postgres and
+`{"code":"Python source from the student's editor"}`. Enrolled students and the
+course's teacher can run a lab. The backend fetches the complete `tests` text from Postgres and
 sends `{code, tests}` to the runner's `/run?view=student` endpoint. It does not use
 the stored starter or reference solution as the submitted code.
 

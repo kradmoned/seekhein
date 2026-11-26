@@ -1,5 +1,6 @@
 import { requireUser } from "../../../../lib/auth"
 import { pool } from "../../../../lib/db"
+import { courseAccessSql } from "../../../../lib/courses"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -9,13 +10,14 @@ type Lab = {
   title: string
   instructions: string
   starter: string
+  course_id: string
 }
 
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const { error } = await requireUser(req)
+  const { user, error } = await requireUser(req)
   if (error) return error
 
   const { id } = await params
@@ -31,10 +33,10 @@ export async function GET(
 
   try {
     const result = await pool.query<Lab>(
-      `SELECT id, title, instructions, starter
-       FROM public.labs
-       WHERE id = $1`,
-      [id],
+      `SELECT l.id, l.title, l.instructions, l.starter, l.course_id
+       FROM public.labs l JOIN public.courses c ON c.id = l.course_id
+       WHERE ${courseAccessSql} AND l.id = $3`,
+      [user.id, user.role, id],
     )
 
     const lab = result.rows[0]
@@ -52,6 +54,7 @@ export async function GET(
         title: lab.title,
         instructions: lab.instructions,
         starter: lab.starter,
+        course_id: lab.course_id,
       },
       { headers: { "Cache-Control": "private, no-store" } },
     )

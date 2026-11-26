@@ -1,34 +1,32 @@
 import { requireUser } from "../../../lib/auth"
 import { pool } from "../../../lib/db"
+import { courseAccessSql, requireCourse } from "../../../lib/courses"
+import { errorResponse, uuidPattern } from "../../../lib/http"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
 export async function GET(req: Request) {
-  const { error } = await requireUser(req)
+  const { user, error } = await requireUser(req)
   if (error) return error
 
   try {
-    const result = await pool.query<{ id: string; title: string }>(
-      `SELECT id, title
-       FROM public.labs
-       ORDER BY created_at DESC, id DESC`,
+    const courseId = new URL(req.url).searchParams.get("course_id")
+    if (courseId !== null) await requireCourse(courseId, user)
+    const result = await pool.query<{ id: string; title: string; course_id: string }>(
+      `SELECT l.id, l.title, l.course_id
+       FROM public.labs l JOIN public.courses c ON c.id = l.course_id
+       WHERE ${courseAccessSql} AND ($3::uuid IS NULL OR l.course_id = $3)
+       ORDER BY l.created_at DESC, l.id DESC`,
+      [user.id, user.role, courseId],
     )
 
     return Response.json(
-      result.rows.map(({ id, title }) => ({ id, title })),
+      result.rows.map(({ id, title, course_id }) => ({ id, title, course_id })),
       { headers: { "Cache-Control": "private, no-store" } },
     )
   } catch (error) {
-    console.error(
-      "Lab list failed:",
-      error instanceof Error ? error.message : "Unknown error",
-    )
-
-    return Response.json(
-      { error: "Unable to fetch labs" },
-      { status: 500 },
-    )
+    return errorResponse(error, "Unable to fetch labs")
   }
 }
 
@@ -70,6 +68,17 @@ export async function POST(req: Request) {
   const validationErrors: string[] = []
   const titleValue = form.get("title")
   const title = typeof titleValue === "string" ? titleValue.trim() : ""
+  const courseValues = form.getAll("course_id")
+  const courseId = courseValues[0]
+
+  if (courseValues.length !== 1 || typeof courseId !== "string" || !uuidPattern.test(courseId)) {
+    return Response.json({ errors: ["A valid course_id is required."] }, { status: 422 })
+  }
+  try {
+    await requireCourse(courseId, user)
+  } catch (error) {
+    return errorResponse(error, "Unable to access course")
+  }
 
   if (!title) {
     validationErrors.push("A lab title is required.")
@@ -130,9 +139,11 @@ export async function POST(req: Request) {
          instructions,
          starter,
          tests,
-         solution
+         solution,
+         course_id
        )
-       VALUES ($1, $2, $3, $4, $5, $6)
+       SELECT $1, $2, $3, $4, $5, $6, c.id
+       FROM public.courses c WHERE c.id = $7 AND c.teacher_id = $1
        RETURNING id`,
       [
         user.id,
@@ -141,22 +152,18 @@ export async function POST(req: Request) {
         files.starter,
         files.tests,
         files.solution,
+        courseId,
       ],
     )
 
+    if (!result.rows[0]) {
+      return Response.json({ error: "Course not found" }, { status: 404 })
+    }
     return Response.json(
       { id: result.rows[0].id },
       { status: 201 },
     )
   } catch (error) {
-    console.error(
-      "Lab upload failed:",
-      error instanceof Error ? error.message : "Unknown error",
-    )
-
-    return Response.json(
-      { error: "Unable to save the lab" },
-      { status: 500 },
-    )
+    return errorResponse(error, "Unable to save the lab")
   }
 }

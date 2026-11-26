@@ -1,5 +1,6 @@
 import { requireUser } from "../../../../../lib/auth"
 import { pool } from "../../../../../lib/db"
+import { courseAccessSql } from "../../../../../lib/courses"
 import { BodyTooLargeError, readJsonBody } from "../../../../../lib/json"
 import {
   maxRequestBytes,
@@ -14,7 +15,7 @@ export async function POST(
   req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const { error } = await requireUser(req)
+  const { user, error } = await requireUser(req)
   if (error) return error
 
   const { id } = await params
@@ -57,8 +58,10 @@ export async function POST(
 
   try {
     const result = await pool.query<{ tests: string }>(
-      `SELECT tests FROM public.labs WHERE id = $1`,
-      [id],
+      `SELECT l.tests FROM public.labs l
+       JOIN public.courses c ON c.id = l.course_id
+       WHERE ${courseAccessSql} AND l.id = $3`,
+      [user.id, user.role, id],
     )
     const lab = result.rows[0]
     if (!lab) {
