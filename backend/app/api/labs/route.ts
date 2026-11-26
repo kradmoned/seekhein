@@ -2,6 +2,35 @@ import { requireUser } from "../../../lib/auth"
 import { pool } from "../../../lib/db"
 
 export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
+
+export async function GET(req: Request) {
+  const { error } = await requireUser(req)
+  if (error) return error
+
+  try {
+    const result = await pool.query<{ id: string; title: string }>(
+      `SELECT id, title
+       FROM public.labs
+       ORDER BY created_at DESC, id DESC`,
+    )
+
+    return Response.json(
+      result.rows.map(({ id, title }) => ({ id, title })),
+      { headers: { "Cache-Control": "private, no-store" } },
+    )
+  } catch (error) {
+    console.error(
+      "Lab list failed:",
+      error instanceof Error ? error.message : "Unknown error",
+    )
+
+    return Response.json(
+      { error: "Unable to fetch labs" },
+      { status: 500 },
+    )
+  }
+}
 
 const fileFields = [
   "instructions",
