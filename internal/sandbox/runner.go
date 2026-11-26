@@ -71,10 +71,8 @@ func newRunnerWithClient(ctx context.Context, cfg Config, cli dockerAPI) (*runne
 		return nil, fmt.Errorf("%w: docker daemon ping failed: %v", ErrSandboxUnavailable, err)
 	}
 
-	inspectCtx, cancelInspect := context.WithTimeout(ctx, 5*time.Second)
-	defer cancelInspect()
-	if _, err := cli.ImageInspect(inspectCtx, cfg.Image); err != nil {
-		return nil, fmt.Errorf("%w: sandbox image %q not found (build with 'make sandbox-image'): %v", ErrSandboxUnavailable, cfg.Image, err)
+	if err := ensureImage(ctx, cli, cfg); err != nil {
+		return nil, err
 	}
 
 	return &runner{

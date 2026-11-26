@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -19,10 +20,12 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -68,15 +71,21 @@ func (m *mockHijackedConn) WrittenBytes() []byte {
 }
 
 type mockDockerAPI struct {
-	pingErr       error
-	inspectImgErr error
-	createErr     error
-	attachErr     error
-	startErr      error
+	pingErr        error
+	inspectImgErr  error
+	inspectImgResp image.InspectResponse
+	buildImgErr    error
+	buildImgStream string
+	createErr      error
+	attachErr      error
+	startErr       error
 
 	mu               sync.Mutex
 	lastCfg          *container.Config
 	lastHostCfg      *container.HostConfig
+	buildCalls       int
+	lastBuildOpts    build.ImageBuildOptions
+	lastBuildTar     []byte
 	removedIDs       []string
 	started          bool
 	waitedAfterStart bool
@@ -100,7 +109,30 @@ func (m *mockDockerAPI) Ping(_ context.Context) (types.Ping, error) {
 }
 
 func (m *mockDockerAPI) ImageInspect(_ context.Context, _ string, _ ...client.ImageInspectOption) (image.InspectResponse, error) {
-	return image.InspectResponse{}, m.inspectImgErr
+	return m.inspectImgResp, m.inspectImgErr
+}
+
+func (m *mockDockerAPI) ImageBuild(_ context.Context, buildContext io.Reader, options build.ImageBuildOptions) (build.ImageBuildResponse, error) {
+	var raw []byte
+	if buildContext != nil {
+		raw, _ = io.ReadAll(buildContext)
+	}
+	m.mu.Lock()
+	m.buildCalls++
+	m.lastBuildOpts = options
+	m.lastBuildTar = raw
+	stream := m.buildImgStream
+	m.mu.Unlock()
+
+	if m.buildImgErr != nil {
+		return build.ImageBuildResponse{}, m.buildImgErr
+	}
+	if stream == "" {
+		stream = "{\"stream\":\"Successfully built 123456\\n\"}\n"
+	}
+	return build.ImageBuildResponse{
+		Body: io.NopCloser(strings.NewReader(stream)),
+	}, nil
 }
 
 func (m *mockDockerAPI) ContainerCreate(_ context.Context, cfg *container.Config, hostCfg *container.HostConfig, _ *network.NetworkingConfig, _ *ocispec.Platform, _ string) (container.CreateResponse, error) {
@@ -273,6 +305,115 @@ func TestNewRunnerFailFast(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "make sandbox-image") {
 			t.Fatalf("expected actionable build hint in error, got %v", err)
+		}
+	})
+}
+
+func TestEmbeddedAutoBuildImage(t *testing.T) {
+	_, expectedDigest, err := buildEmbeddedTar()
+	if err != nil {
+		t.Fatalf("buildEmbeddedTar: %v", err)
+	}
+
+	t.Run("builds embedded image when missing", func(t *testing.T) {
+		cli := newMockDockerAPI()
+		cli.inspectImgErr = errors.New("No such image")
+		cfg := DefaultConfig()
+		cfg.AutoBuildImage = true
+
+		if _, err := newRunnerWithClient(context.Background(), cfg, cli); err != nil {
+			t.Fatalf("newRunnerWithClient auto-build: %v", err)
+		}
+		if cli.buildCalls != 1 {
+			t.Fatalf("expected 1 ImageBuild call, got %d", cli.buildCalls)
+		}
+		if len(cli.lastBuildOpts.Tags) != 1 || cli.lastBuildOpts.Tags[0] != DefaultImage {
+			t.Fatalf("unexpected build tags: %v", cli.lastBuildOpts.Tags)
+		}
+		if cli.lastBuildOpts.Labels[embeddedDigestLabel] != expectedDigest {
+			t.Fatalf("expected digest label %q, got %q", expectedDigest, cli.lastBuildOpts.Labels[embeddedDigestLabel])
+		}
+
+		tr := tar.NewReader(bytes.NewReader(cli.lastBuildTar))
+		found := map[string]bool{}
+		for {
+			hdr, err := tr.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("read build tar: %v", err)
+			}
+			found[hdr.Name] = hdr.Size > 0
+		}
+		if !found["Dockerfile"] || !found["harness.py"] {
+			t.Fatalf("expected Dockerfile and harness.py in build tar, got %v", found)
+		}
+	})
+
+	t.Run("skips build when digest matches", func(t *testing.T) {
+		cli := newMockDockerAPI()
+		cli.inspectImgResp = image.InspectResponse{
+			Config: &dockerspec.DockerOCIImageConfig{
+				ImageConfig: ocispec.ImageConfig{
+					Labels: map[string]string{embeddedDigestLabel: expectedDigest},
+				},
+			},
+		}
+		cfg := DefaultConfig()
+		cfg.AutoBuildImage = true
+
+		if _, err := newRunnerWithClient(context.Background(), cfg, cli); err != nil {
+			t.Fatalf("newRunnerWithClient: %v", err)
+		}
+		if cli.buildCalls != 0 {
+			t.Fatalf("expected 0 ImageBuild calls when digest matches, got %d", cli.buildCalls)
+		}
+	})
+
+	t.Run("rebuilds when digest is stale", func(t *testing.T) {
+		cli := newMockDockerAPI()
+		cli.inspectImgResp = image.InspectResponse{
+			Config: &dockerspec.DockerOCIImageConfig{
+				ImageConfig: ocispec.ImageConfig{
+					Labels: map[string]string{embeddedDigestLabel: "stale-digest"},
+				},
+			},
+		}
+		cfg := DefaultConfig()
+		cfg.AutoBuildImage = true
+
+		if _, err := newRunnerWithClient(context.Background(), cfg, cli); err != nil {
+			t.Fatalf("newRunnerWithClient: %v", err)
+		}
+		if cli.buildCalls != 1 {
+			t.Fatalf("expected 1 ImageBuild call for stale digest, got %d", cli.buildCalls)
+		}
+	})
+
+	t.Run("skips build for manual image without label", func(t *testing.T) {
+		cli := newMockDockerAPI()
+		cfg := DefaultConfig()
+		cfg.AutoBuildImage = true
+
+		if _, err := newRunnerWithClient(context.Background(), cfg, cli); err != nil {
+			t.Fatalf("newRunnerWithClient: %v", err)
+		}
+		if cli.buildCalls != 0 {
+			t.Fatalf("expected 0 ImageBuild calls for manually built image, got %d", cli.buildCalls)
+		}
+	})
+
+	t.Run("surfaces build stream error as ErrSandboxUnavailable", func(t *testing.T) {
+		cli := newMockDockerAPI()
+		cli.inspectImgErr = errors.New("No such image")
+		cli.buildImgStream = "{\"error\":\"failed to fetch base image\"}\n"
+		cfg := DefaultConfig()
+		cfg.AutoBuildImage = true
+
+		_, err := newRunnerWithClient(context.Background(), cfg, cli)
+		if !errors.Is(err, ErrSandboxUnavailable) || !strings.Contains(err.Error(), "failed to fetch base image") {
+			t.Fatalf("expected ErrSandboxUnavailable with stream error, got %v", err)
 		}
 	})
 }

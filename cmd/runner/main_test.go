@@ -111,6 +111,33 @@ func TestRunEndpointViewsAndErrors(t *testing.T) {
 		t.Fatalf("tutor view missing expected failure context: %s", recTutor.Body.String())
 	}
 
+	// Both view returns leak-safe student view alongside full tutor context in one run.
+	reqBoth := httptest.NewRequest(http.MethodPost, "/run?view=both", bytes.NewBufferString(`{"code":"def f(x): return x","tests":"import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass"}`))
+	recBoth := httptest.NewRecorder()
+	h.ServeHTTP(recBoth, reqBoth)
+	if recBoth.Code != http.StatusOK {
+		t.Fatalf("expected 200 for view=both, got %d", recBoth.Code)
+	}
+	var bothPayload struct {
+		Student json.RawMessage         `json:"student"`
+		Tutor   sandbox.TutorRunContext `json:"tutor"`
+	}
+	if err := json.Unmarshal(recBoth.Body.Bytes(), &bothPayload); err != nil {
+		t.Fatalf("unmarshal view=both response: %v", err)
+	}
+	if !bytes.Contains(bothPayload.Student, []byte("x=99")) || !bytes.Contains(bothPayload.Student, []byte("0 != 100")) {
+		t.Fatalf("view=both student missing expected diagnostics: %s", bothPayload.Student)
+	}
+	if bytes.Contains(bothPayload.Student, []byte("secret traceback")) {
+		t.Fatalf("view=both student leaked internal Detail: %s", bothPayload.Student)
+	}
+	if len(bothPayload.Tutor.PassedTests) != 1 || bothPayload.Tutor.PassedTests[0] != "test_basic" {
+		t.Fatalf("view=both tutor unexpected PassedTests: %+v", bothPayload.Tutor.PassedTests)
+	}
+	if len(bothPayload.Tutor.Failures) != 1 || bothPayload.Tutor.Failures[0].Detail != "secret traceback" || bothPayload.Tutor.Failures[0].Inputs != "x=99" {
+		t.Fatalf("view=both tutor unexpected Failures: %+v", bothPayload.Tutor.Failures)
+	}
+
 	// Invalid view returns 400.
 	reqBad := httptest.NewRequest(http.MethodPost, "/run?view=admin", bytes.NewBufferString(`{"code":"a","tests":"b"}`))
 	recBad := httptest.NewRecorder()
@@ -173,5 +200,22 @@ func TestValidateEndpoint(t *testing.T) {
 	hFail.ServeHTTP(recFail, httptest.NewRequest(http.MethodPost, "/validate", bytes.NewBufferString(`{"solution":"x=1","tests":"pass"}`)))
 	if recFail.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 on invalid lab, got %d", recFail.Code)
+	}
+}
+
+func TestConfigFromEnvAutoBuild(t *testing.T) {
+	t.Setenv("SANDBOX_AUTO_BUILD", "")
+	if cfg := configFromEnv(); !cfg.AutoBuildImage {
+		t.Fatalf("expected AutoBuildImage=true by default")
+	}
+
+	t.Setenv("SANDBOX_AUTO_BUILD", "false")
+	if cfg := configFromEnv(); cfg.AutoBuildImage {
+		t.Fatalf("expected AutoBuildImage=false when SANDBOX_AUTO_BUILD=false")
+	}
+
+	t.Setenv("SANDBOX_AUTO_BUILD", "true")
+	if cfg := configFromEnv(); !cfg.AutoBuildImage {
+		t.Fatalf("expected AutoBuildImage=true when SANDBOX_AUTO_BUILD=true")
 	}
 }

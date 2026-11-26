@@ -2,8 +2,10 @@ package sandbox
 
 import (
 	"context"
+	"io"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -16,6 +18,7 @@ import (
 type dockerAPI interface {
 	Ping(ctx context.Context) (types.Ping, error)
 	ImageInspect(ctx context.Context, imageID string, inspectOpts ...client.ImageInspectOption) (image.InspectResponse, error)
+	ImageBuild(ctx context.Context, buildContext io.Reader, options build.ImageBuildOptions) (build.ImageBuildResponse, error)
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
 	ContainerAttach(ctx context.Context, containerID string, options container.AttachOptions) (types.HijackedResponse, error)
 	ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error
@@ -35,6 +38,10 @@ func (s *sdkDockerClient) Ping(ctx context.Context) (types.Ping, error) {
 
 func (s *sdkDockerClient) ImageInspect(ctx context.Context, imageID string, inspectOpts ...client.ImageInspectOption) (image.InspectResponse, error) {
 	return s.cli.ImageInspect(ctx, imageID, inspectOpts...)
+}
+
+func (s *sdkDockerClient) ImageBuild(ctx context.Context, buildContext io.Reader, options build.ImageBuildOptions) (build.ImageBuildResponse, error) {
+	return s.cli.ImageBuild(ctx, buildContext, options)
 }
 
 func (s *sdkDockerClient) ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error) {

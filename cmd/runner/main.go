@@ -32,6 +32,11 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type bothViewsResponse struct {
+	Student sandbox.StudentRunResult `json:"student"`
+	Tutor   sandbox.TutorRunContext  `json:"tutor"`
+}
+
 // NewHandler constructs the standalone HTTP API handler backed by a sandbox.Runner.
 func NewHandler(r sandbox.Runner) http.Handler {
 	mux := http.NewServeMux()
@@ -50,8 +55,8 @@ func NewHandler(r sandbox.Runner) http.Handler {
 		if view == "" {
 			view = "student"
 		}
-		if view != "student" && view != "tutor" && view != "full" {
-			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid view parameter (must be student, tutor, or full)"})
+		if view != "student" && view != "tutor" && view != "full" && view != "both" {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid view parameter (must be student, tutor, full, or both)"})
 			return
 		}
 
@@ -78,6 +83,11 @@ func NewHandler(r sandbox.Runner) http.Handler {
 			writeJSON(w, http.StatusOK, res.ToTutorContext())
 		case "full":
 			writeJSON(w, http.StatusOK, res)
+		case "both":
+			writeJSON(w, http.StatusOK, bothViewsResponse{
+				Student: res.ToStudentView(),
+				Tutor:   res.ToTutorContext(),
+			})
 		default:
 			writeJSON(w, http.StatusOK, res.ToStudentView())
 		}
@@ -145,8 +155,14 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func configFromEnv() sandbox.Config {
 	cfg := sandbox.DefaultConfig()
+	cfg.AutoBuildImage = true
 	if img := os.Getenv("SANDBOX_IMAGE"); img != "" {
 		cfg.Image = img
+	}
+	if raw := os.Getenv("SANDBOX_AUTO_BUILD"); raw != "" {
+		if b, err := strconv.ParseBool(raw); err == nil {
+			cfg.AutoBuildImage = b
+		}
 	}
 	if v, ok := envPositiveInt("SANDBOX_MAX_CONCURRENT"); ok {
 		cfg.MaxConcurrent = v
@@ -181,10 +197,15 @@ func main() {
 		addr = ":8081"
 	}
 
-	initCtx, cancelInit := context.WithTimeout(context.Background(), 10*time.Second)
+	cfg := configFromEnv()
+	initTimeout := 10 * time.Second
+	if cfg.AutoBuildImage {
+		initTimeout = 5 * time.Minute
+	}
+	initCtx, cancelInit := context.WithTimeout(context.Background(), initTimeout)
 	defer cancelInit()
 
-	runner, err := sandbox.NewRunner(initCtx, configFromEnv())
+	runner, err := sandbox.NewRunner(initCtx, cfg)
 	if err != nil {
 		log.Fatalf("failed to initialize sandbox runner: %v", err)
 	}

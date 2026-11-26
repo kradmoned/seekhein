@@ -23,6 +23,7 @@ const (
 // Config controls container resource limits, timeouts, and worker concurrency.
 type Config struct {
 	Image              string
+	AutoBuildImage     bool
 	MaxConcurrent      int
 	QueueWaitTimeout   time.Duration
 	PerTestTimeout     time.Duration
