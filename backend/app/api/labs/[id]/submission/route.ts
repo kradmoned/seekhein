@@ -15,10 +15,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       `SELECT l.id AS lab_id, l.allow_resubmissions, l.max_submissions,
        (SELECT count(*)::int FROM public.submissions s
          WHERE s.lab_id = l.id AND s.student_id = $2 AND s.kind = 'final') AS accepted_submission_count, (
-         SELECT jsonb_build_object('submission_id', s.id, 'submitted_at', s.created_at,
+         SELECT json_build_object('submission_id', s.id, 'submitted_at', s.created_at,
            'version', s.version, 'code_sha256', s.code_sha256,
-           'execution', jsonb_build_object('status', s.status, 'results', s.results,
-             'score', s.score, 'passed', s.passed, 'total', s.total))
+           'submit_anyway', s.submit_anyway,
+           'submission_status', CASE WHEN s.status = 'ok' AND s.total > 0 AND s.passed = s.total THEN 'passed' ELSE 'pending_review' END,
+           'execution', COALESCE(s.execution_output, json_build_object('status', s.status, 'results', s.results,
+             'score', s.score, 'passed', s.passed, 'total', s.total)))
          FROM public.submissions s WHERE s.lab_id = l.id AND s.student_id = $2 AND s.kind = 'final'
          ORDER BY s.version DESC LIMIT 1
        ) AS accepted_submission

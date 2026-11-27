@@ -14,7 +14,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ submissi
     if (!uuidPattern.test(submissionId)) throw new HttpError(400, "Invalid submission ID")
     const result = await pool.query<SubmissionSummary & { lab_id: string; student_id: string; code: string }>(
       `SELECT s.id, s.lab_id, s.student_id, s.code, s.kind, s.version, s.code_sha256,
-         s.status, s.results, s.score, s.passed, s.total, s.created_at
+         s.status, s.results, s.score, s.passed, s.total, s.created_at, s.execution_output, s.submit_anyway
        FROM public.submissions s JOIN public.labs l ON l.id = s.lab_id
        JOIN public.courses c ON c.id = l.course_id
        WHERE s.id = $1 AND s.kind = 'final' AND c.teacher_id = $2`, [submissionId, user.id],

@@ -75,21 +75,26 @@ function harness(options = {}) {
 function runnerResult() {
   return {
     status: "ok", score: 50, passed: 1, failed: 1, ran: 2, total: 2,
-    stdout: secret, internal_error: secret, syntax_error: { code_line: secret },
+    stdout: secret, stdout_truncated: true, duration_ms: 12, internal_error: "NOT_A_STUDENT_FIELD",
+    syntax_error: { error_type: "SyntaxError", error_message: "expected ':'", line: 1, code_line: "def add(a,b)" },
     tests: [
-      { name: secret, display_name: secret, status: "passed", passed: true, expected: secret, inputs: secret, actual: secret, stdout: secret },
-      { name: secret, status: "failed", passed: false, error_message: secret, traceback: [{ code: secret }], detail: secret },
+      { index: 1, name: secret, display_name: secret, status: "passed", passed: true, duration_ms: 1, expected: secret, inputs: secret, actual: secret, stdout: secret, stdout_truncated: true },
+      { index: 2, name: secret, display_name: "Failed case", status: "failed", passed: false, duration_ms: 2, error_type: "ZeroDivisionError", error_message: secret, traceback: [{ line: 3, function: "add", code: secret }], detail: "NOT_A_STUDENT_FIELD" },
     ],
   }
 }
 
-test("run uses editor code and full database tests, then returns only safe fields", async () => {
+test("run returns and stores every documented student-view field plus legacy results", async () => {
   const h = harness({ env: { RUNNER_INTERNAL_KEY: "server-test-key" } })
   const response = await h.run()
   assert.equal(response.status, 200)
   assert.equal(response.headers.get("cache-control"), "private, no-store")
-  assert.deepEqual(await response.json(), {
-    status: "ok", score: 50, passed: 1, total: 2,
+  const body = await response.json()
+  const expected = runnerResult()
+  delete expected.internal_error
+  delete expected.tests[1].detail
+  assert.deepEqual(body, {
+    ...expected,
     results: [
       { name: "Test 1", passed: true, error: null },
       { name: "Test 2", passed: false, error: "Test failed" },
@@ -110,6 +115,7 @@ test("run uses editor code and full database tests, then returns only safe field
   assert.equal(h.queries[1].values[1], labId)
   assert.equal(h.queries[1].values[2], code)
   assert.doesNotMatch(h.queries[1].values[4], new RegExp(secret))
+  assert.deepEqual(JSON.parse(h.queries[1].values[8]), body)
 })
 
 test("teacher preview runs do not create student submissions", async () => {
@@ -144,6 +150,7 @@ for (const [name, body, id, contentType, status] of [
   ["empty code", { code: " \n " }, labId, "application/json", 422],
   ["browser-supplied tests", { code, tests: "assert True" }, labId, "application/json", 422],
   ["browser-supplied view", { code, view: "tutor" }, labId, "application/json", 422],
+  ["submit-anyway flag on practice run", { code, submit_anyway: true }, labId, "application/json", 422],
   ["code exceeds byte limit", { code: "é".repeat(32769) }, labId, "application/json", 413],
   ["oversized request without Content-Length", " ".repeat(512 * 1024 + 1), labId, "application/json", 413],
 ]) {
@@ -193,16 +200,27 @@ for (const [upstream, expected] of [[400, 502], [401, 502], [413, 502], [429, 42
 }
 
 for (const status of ["syntax_error", "runtime_error", "timeout", "oom", "internal_error", "ok"]) {
-  test(`handles runner status ${status} without leaked diagnostics`, async () => {
+  test(`handles runner status ${status} with diagnostics for processed executions`, async () => {
     const result = { ...runnerResult(), status, score: 0, passed: 0, failed: 0, ran: 0, total: 0, tests: [] }
     const h = harness({ result })
     const response = await h.run()
     assert.equal(response.status, status === "internal_error" ? 502 : status === "ok" ? 422 : 200)
-    assert.doesNotMatch(await response.text(), new RegExp(secret))
+    const body = await response.json()
+    if (response.status === 200) {
+      assert.equal(body.stdout, secret)
+      assert.deepEqual(body.syntax_error, result.syntax_error)
+      assert.deepEqual(body.tests, [])
+      assert.equal(body.internal_error, undefined)
+      assert.deepEqual(JSON.parse(h.queries[1].values[8]), body)
+    } else assert.ok(!JSON.stringify(body).includes(secret))
   })
 }
 
-for (const result of [null, {}, { ...runnerResult(), score: 100 }, { ...runnerResult(), total: 3 }, { ...runnerResult(), status: secret }]) {
+for (const result of [null, {}, { ...runnerResult(), score: 100 }, { ...runnerResult(), total: 3 }, { ...runnerResult(), status: secret },
+  { ...runnerResult(), stdout: 1 }, { ...runnerResult(), stdout_truncated: "false" },
+  { ...runnerResult(), duration_ms: -1 }, { ...runnerResult(), syntax_error: { line: "1" } },
+  { ...runnerResult(), tests: runnerResult().tests.map((test) => ({ ...test, traceback: [{ line: "3", function: "add", code: "return 1" }] })) },
+]) {
   test("malformed or inconsistent runner result fails closed", async () => {
     const h = harness({ fetch: async () => Response.json(result) })
     const response = await h.run()

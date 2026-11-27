@@ -1,4 +1,5 @@
 import { readJsonBody } from "./json"
+import { studentDiagnostics } from "./runner-result"
 
 export const maxSourceBytes = 64 * 1024
 export const maxRequestBytes = 512 * 1024
@@ -50,7 +51,7 @@ function studentResult(data: unknown) {
     }
 
     if (
-      !["passed", "failed", "timeout", "not_run"].includes(String(test.status)) ||
+      typeof test.status !== "string" || !["passed", "failed", "timeout", "not_run"].includes(test.status) ||
       test.passed !== (test.status === "passed")
     ) {
       return invalidResponse()
@@ -59,8 +60,8 @@ function studentResult(data: unknown) {
     if (test.passed) passed++
     if (test.status === "failed" || test.status === "timeout") failed++
 
-    // Even names, labels, stdout, and solution-only tracebacks can reveal
-    // hidden inputs. Return only generated labels and fixed error messages.
+    // Keep the existing results array for clients using the compact contract.
+    // Full runner diagnostics are returned separately in tests/stdout/etc.
     return {
       name: `Test ${index + 1}`,
       passed: test.passed,
@@ -91,7 +92,7 @@ function studentResult(data: unknown) {
     throw new RunnerError(422, "This lab has no runnable unittest tests. Contact your teacher.")
   }
 
-  return { status: data.status, results, score, passed, total }
+  return { ...studentDiagnostics(data, invalidResponse), results }
 }
 
 export async function runCode(code: string, tests: string) {

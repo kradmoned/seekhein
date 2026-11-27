@@ -42,11 +42,11 @@ export async function POST(
     if (user.role === "student") {
       await pool.query(
         `INSERT INTO public.submissions
-           (lab_id, student_id, code, status, results, score, passed, total)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)`,
+           (lab_id, student_id, code, status, results, score, passed, total, execution_output)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::json)`,
         [id, user.id, code, resultForStudent.status,
           JSON.stringify(resultForStudent.results), resultForStudent.score,
-          resultForStudent.passed, resultForStudent.total],
+          resultForStudent.passed, resultForStudent.total, JSON.stringify(resultForStudent)],
       )
     }
     return Response.json(resultForStudent, {

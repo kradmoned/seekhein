@@ -11,7 +11,7 @@ export class SubmissionError extends HttpError {
 
 type Outcome = { http_status: number; body: Record<string, unknown> }
 
-export async function submitFinal(labId: string, studentId: string, key: string, code: string): Promise<Outcome> {
+export async function submitFinal(labId: string, studentId: string, key: string, code: string, submitAnyway = false): Promise<Outcome> {
   labId = labId.toLowerCase()
   studentId = studentId.toLowerCase()
   // Access is checked even on replay; a key never grants access by itself.
@@ -21,16 +21,18 @@ export async function submitFinal(labId: string, studentId: string, key: string,
   )
   if (!access.rows[0]) throw new SubmissionError(404, "LAB_NOT_FOUND", "Lab not found")
   await pool.query(
-    `INSERT INTO public.submission_requests (lab_id, student_id, idempotency_key, code)
-     VALUES ($1, $2, $3, $4) ON CONFLICT (lab_id, student_id, idempotency_key) DO NOTHING`,
-    [labId, studentId, key, code],
+    `INSERT INTO public.submission_requests (lab_id, student_id, idempotency_key, code, submit_anyway)
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (lab_id, student_id, idempotency_key) DO NOTHING`,
+    [labId, studentId, key, code, submitAnyway],
   )
-  const requests = await pool.query<{ id: string; code: string }>(
-    `SELECT id, code FROM public.submission_requests WHERE lab_id = $1 AND student_id = $2 AND idempotency_key = $3`,
+  const requests = await pool.query<{ id: string; code: string; submit_anyway: boolean }>(
+    `SELECT id, code, submit_anyway FROM public.submission_requests WHERE lab_id = $1 AND student_id = $2 AND idempotency_key = $3`,
     [labId, studentId, key],
   )
   const request = requests.rows[0]
-  if (request.code !== code) throw new SubmissionError(409, "IDEMPOTENCY_KEY_REUSED", "This key was already used with different code")
+  if (request.code !== code || request.submit_anyway !== submitAnyway) {
+    throw new SubmissionError(409, "IDEMPOTENCY_KEY_REUSED", "This key was already used with different code or submission mode")
+  }
   const replay = await pool.query<Outcome>(
     "SELECT http_status, body FROM public.submission_outcomes WHERE request_id = $1", [request.id],
   )
@@ -73,25 +75,31 @@ export async function submitFinal(labId: string, studentId: string, key: string,
       } }
     } else {
       const execution = await runCode(code, lab.tests)
-      const accepted = execution.status === "ok" && execution.total > 0 && execution.passed === execution.total
+      const passedAllTests = execution.status === "ok" && execution.total > 0 && execution.passed === execution.total
+      const accepted = passedAllTests || submitAnyway
       let submissionId: string | null = null
       let submittedAt: string | null = null
       if (accepted) {
         const saved = await client.query<{ id: string; created_at: Date }>(
           `INSERT INTO public.submissions
-             (lab_id, student_id, code, status, results, score, passed, total, kind, request_id, code_sha256)
-           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, 'final', $9, $10)
+             (lab_id, student_id, code, status, results, score, passed, total, kind, request_id, code_sha256, execution_output, submit_anyway)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, 'final', $9, $10, $11::json, $12)
            RETURNING id, created_at`,
           [labId, studentId, code, execution.status, JSON.stringify(execution.results), execution.score,
-            execution.passed, execution.total, request.id, createHash("sha256").update(code, "utf8").digest("hex")],
+            execution.passed, execution.total, request.id, createHash("sha256").update(code, "utf8").digest("hex"), JSON.stringify(execution), submitAnyway],
         )
         submissionId = saved.rows[0].id
         submittedAt = saved.rows[0].created_at.toISOString()
       }
-      outcome = { http_status: 200, body: { accepted, submission_id: submissionId, submitted_at: submittedAt, execution } }
+      outcome = { http_status: 200, body: {
+        accepted, submission_id: submissionId, submitted_at: submittedAt,
+        submit_anyway: submitAnyway,
+        submission_status: accepted ? (passedAllTests ? "passed" : "pending_review") : null,
+        execution,
+      } }
     }
     await client.query(
-      "INSERT INTO public.submission_outcomes (request_id, http_status, body) VALUES ($1, $2, $3::jsonb)",
+      "INSERT INTO public.submission_outcomes (request_id, http_status, body) VALUES ($1, $2, $3::json)",
       [request.id, outcome.http_status, JSON.stringify(outcome.body)],
     )
     // An accepted row and its replayable outcome commit together.

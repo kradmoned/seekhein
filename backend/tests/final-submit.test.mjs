@@ -43,6 +43,8 @@ test("Submit validates source before invoking final execution", async () => {
     ["{", 400], [null, 422], [{ code: " " }, 422], [{ code: "pass", tests: "secret" }, 422],
     [{ code: "é".repeat(32769) }, 413], [" ".repeat(524289), 413],
     [{ code: "\0" }, 422], [{ code: "\ud800" }, 422],
+    [{ code: "pass", submit_anyway: "true" }, 422], [{ code: "pass", submit_anyway: 1 }, 422],
+    [{ code: "pass", submit_anyway: null }, 422], [{ code: "pass", accepted: true }, 422],
   ]) {
     const h = harness()
     assert.equal((await h.send(body)).status, status)
@@ -55,7 +57,15 @@ test("Submit forwards exact source and the required key", async () => {
   const response = await h.send({ code })
   assert.equal(response.status, 200)
   assert.equal(response.headers.get("cache-control"), "private, no-store")
-  assert.deepEqual(h.calls[0], [labId, labId, key, code])
+  assert.deepEqual(h.calls[0], [labId, labId, key, code, false])
+})
+test("Submit anyway forwards an explicit boolean with the exact source", async () => {
+  for (const submitAnyway of [true, false]) {
+    const h = harness()
+    const response = await h.send({ code: "# unfinished\npass\n", submit_anyway: submitAnyway })
+    assert.equal(response.status, 200)
+    assert.deepEqual(h.calls[0], [labId, labId, key, "# unfinished\npass\n", submitAnyway])
+  }
 })
 test("Submit rejects teacher requests before validation", async () => {
   const h = harness("teacher")

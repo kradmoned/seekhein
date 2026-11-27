@@ -127,7 +127,8 @@ Student executions are stored in `submissions`. The lab fetch contract still
 omits `solved` and `last_code`. The frontend can initialize the editor with
 `starter`. Lab detail also includes `max_submissions`, `allow_resubmissions`, and the backend's `integrity_policy`, documented
 in `docs/frontend-integrity.md`.
-Hidden tests and reference solutions are never returned.
+Lab details do not return test source or reference solution source. Execution
+responses include the runner's student-view diagnostics as documented below.
 
 Errors use `{"error":"message"}`:
 
@@ -176,21 +177,34 @@ Example HTTP 200 for a lab with two passing tests:
     {"name": "Test 2", "passed": true, "error": null}
   ],
   "score": 100,
+  "ran": 2,
   "passed": 2,
-  "total": 2
+  "failed": 0,
+  "total": 2,
+  "stdout": "",
+  "stdout_truncated": false,
+  "duration_ms": 12,
+  "tests": [
+    {"index": 1, "name": "test_positive", "display_name": "Positive numbers", "status": "passed", "passed": true, "duration_ms": 1, "expected": "5", "actual": "5"},
+    {"index": 2, "name": "test_negative", "display_name": "Negative numbers", "status": "passed", "passed": true, "duration_ms": 1, "expected": "-5", "actual": "-5"}
+  ]
 }
 ```
 
 `status` extends the planned response so the frontend can distinguish `ok`,
 `syntax_error`, `runtime_error`, `timeout`, and `oom`, including when no tests
 finish. HTTP 200 means execution was processed, not that the code passed.
-Failed cases use fixed messages: `Test failed`, `Test timed out`, or
-`Test was not run`. Names are generated labels, not private Python method names.
+The compatibility `results` array uses fixed messages (`Test failed`,
+`Test timed out`, or `Test was not run`) and generated labels. The `tests` array
+contains the runner's actual labels and detailed diagnostics.
 
-The supplied CodeRunner reference exposes inputs, expected/actual values, and
-assertion messages even in `student` view. The backend deliberately constructs
-its own response and omits those fields, all stdout, tracebacks, raw names,
-docstrings, and source snippets because they could reveal hidden test data.
+Run and Submit now include the complete documented CodeRunner student-view
+output: `tests`, stdout, truncation flags, timings, expected/actual values,
+exception messages, traceback frames, and available syntax-error details. The
+compact `results` array remains for older clients. Test inputs and answers in
+runner diagnostics are intentionally visible to the student. See the
+[runner-output contract](docs/frontend-runner-output.md) for types and console
+rendering. Network and infrastructure error bodies remain filtered.
 
 Limits and errors (`{"error":"message"}`):
 
@@ -239,8 +253,11 @@ class TestAdd(unittest.TestCase):
         self.assertEqual(add(-1, -4), -5)
 ```
 
-Processed student runs are saved with submitted code, sanitized results, counts,
-status, and server time before HTTP 200 is returned. Teacher preview executions
+Processed student runs are saved with submitted code, complete runner output,
+compact results, counts, status, and server time before HTTP 200 is returned.
+Apply `db/migrations/20261128_001_runner_output.sql` after the lab-validation
+migration. Older records retain their compact output because discarded details
+cannot be recovered. Teacher preview executions
 create no student submissions. A storage failure returns HTTP 500 even if
 execution finished. Retrying Run performs a new execution and saves a new
 submission. The runner's Docker isolation and internal-key enforcement must be
@@ -250,7 +267,8 @@ verified against its deployment separately.
 
 Labs support configurable maximum accepted submissions: 1, 2, 3, or another
 positive integer; NULL means unlimited. The first accepted final counts toward
-the limit. Failed executions and practice runs do not consume it.
+the limit. Unfinished work saved with Submit anyway also counts; rejected
+ordinary submissions and practice runs do not.
 
 Apply `db/migrations/20261127_002_final_submissions.sql` after the integrity
 migration, then `db/migrations/20261127_003_submission_limits.sql`. Existing
@@ -263,23 +281,30 @@ positive integer text field or `unlimited`.
   accepted versions and floors remaining allowance at zero.
 
 - `POST /api/labs/{id}/submit` freshly verifies student code. It requires a UUID
-  `Idempotency-Key` header and JSON `{code}`. HTTP 200 returns
-  `{accepted,submission_id,submitted_at,execution}`.
+  `Idempotency-Key` header and JSON `{code, submit_anyway?: boolean}`. HTTP 200
+  returns `{accepted,submission_id,submitted_at,submit_anyway,submission_status,execution}`.
 - `GET /api/labs/{id}/submission` returns the student's current accepted status,
   policy, accepted count, remaining allowance, version, and SHA-256 digest.
 - `GET /api/courses/{courseId}/students/{studentId}/report` gives the course owner
   per-lab practice counts, latest accepted finals, and current integrity.
 - `GET /api/submissions/{submissionId}` lets the course owner inspect an accepted
-  version's exact source and sanitized execution results.
+  version's exact source and saved execution results, including full diagnostics
+  for new records.
 
-A final requires `status=ok`, `total>0`, and `passed=total`. Failed executions
-return `accepted=false` without consuming the allowance. Accepted versions are
+Ordinary Submit requires `status=ok`, `total>0`, and `passed=total`; failures
+return `accepted=false` without consuming the allowance. With
+`submit_anyway: true`, processed failures are saved as `pending_review`, consuming
+one slot. Passing finals are labeled `passed`. Service errors and `ok` results
+with zero tests never create a final. Apply `20261128_002_submit_anyway.sql` after
+the runner-output migration before deploying this support. Teacher reports and
+code inspection include the status; automatic test scores remain separate from
+teacher grading (no grade-entry endpoint is added). Accepted versions are
 preserved and the highest version is current. The backend and database enforce
 the accepted-submission limit, including concurrent requests.
 Practice runs remain unlimited. Teacher preview runs create no student record.
 
-Idempotent replay precedes the submission-lock check. A repeated key/source
-returns its original committed outcome. Different source under that key produces
+Idempotent replay precedes the submission-lock check. A repeated key/source/mode
+returns its original committed outcome. Different source or mode under that key produces
 `409 IDEMPOTENCY_KEY_REUSED`. Concurrent operations for one student/lab produce
 `409 SUBMISSION_PROCESSING` with `Retry-After: 2`. A new action on a locked lab
 returns `409 FINAL_SUBMISSION_LOCKED` for a limit of 1, or
@@ -338,7 +363,7 @@ curl "http://localhost:3000/api/labs/$LAB_ID/report" \
 `GET /api/labs/{id}/report` is restricted to the course's teacher. It includes
 enrolled students plus students with historical activity, execution summaries,
 event timelines, and computed integrity scores sorted ascending. Reports omit
-submitted source, hidden tests, and reference solutions. Chat storage is absent,
+submitted source, test source, and reference solutions. Chat storage is absent,
 so `chat_available` is false. Scores are computed on read and never persisted.
 
 | Rule | Deduction |

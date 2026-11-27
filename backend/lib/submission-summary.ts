@@ -10,6 +10,8 @@ export type SubmissionSummary = {
   passed: number
   total: number
   results: Awaited<ReturnType<typeof runCode>>["results"]
+  execution_output?: Awaited<ReturnType<typeof runCode>> | null
+  submit_anyway: boolean
   created_at: string | Date
 }
 
@@ -19,6 +21,8 @@ export function acceptedSummary(row: SubmissionSummary) {
     submitted_at: row.created_at,
     version: row.version,
     code_sha256: row.code_sha256,
-    execution: { status: row.status, results: row.results, score: row.score, passed: row.passed, total: row.total },
+    submit_anyway: row.submit_anyway,
+    submission_status: row.status === "ok" && row.total > 0 && row.passed === row.total ? "passed" : "pending_review",
+    execution: row.execution_output ?? { status: row.status, results: row.results, score: row.score, passed: row.passed, total: row.total },
   }
 }

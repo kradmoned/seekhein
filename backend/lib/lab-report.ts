@@ -29,7 +29,7 @@ export async function readLabReport(id: string, teacherId: string, studentId: st
          ), '[]'::jsonb),
          'submissions', COALESCE((
            SELECT jsonb_agg(jsonb_build_object(
-             'id', s.id, 'kind', s.kind, 'version', s.version, 'code_sha256', s.code_sha256, 'results', s.results, 'status', s.status, 'score', s.score, 'passed', s.passed,
+             'id', s.id, 'kind', s.kind, 'version', s.version, 'code_sha256', s.code_sha256, 'submit_anyway', s.submit_anyway, 'results', s.results, 'status', s.status, 'score', s.score, 'passed', s.passed,
              'total', s.total, 'created_at', s.created_at
            ) ORDER BY s.created_at, s.id)
            FROM public.submissions s WHERE s.lab_id = l.id AND s.student_id = p.id

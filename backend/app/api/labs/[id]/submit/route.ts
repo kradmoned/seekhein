@@ -1,5 +1,5 @@
 import { requireUser } from "../../../../../lib/auth"
-import { readCode } from "../../../../../lib/code-request"
+import { readSubmission } from "../../../../../lib/code-request"
 import { SubmissionError, submitFinal } from "../../../../../lib/final-submissions"
 import { HttpError, privateHeaders, uuidPattern } from "../../../../../lib/http"
 import { RunnerError } from "../../../../../lib/runner"
@@ -14,11 +14,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (!uuidPattern.test(id)) throw new SubmissionError(400, "INVALID_LAB_ID", "Invalid lab ID")
     const key = req.headers.get("idempotency-key")
     if (!key || !uuidPattern.test(key)) throw new SubmissionError(400, "INVALID_IDEMPOTENCY_KEY", "A UUID Idempotency-Key header is required")
-    const code = await readCode(req)
+    const { code, submit_anyway: submitAnyway } = await readSubmission(req)
     if (code.includes("\0") || Buffer.from(code, "utf8").toString("utf8") !== code) {
       throw new HttpError(422, "Code must be valid Unicode without null characters")
     }
-    const outcome = await submitFinal(id, user.id, key, code)
+    const outcome = await submitFinal(id, user.id, key, code, submitAnyway)
     return Response.json(outcome.body, { status: outcome.http_status, headers: privateHeaders })
   } catch (error) {
     if (error instanceof SubmissionError) {

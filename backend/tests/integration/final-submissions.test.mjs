@@ -13,10 +13,20 @@ const root = fileURLToPath(new URL("../../", import.meta.url))
 const require = createRequire(import.meta.url)
 
 test("final submission routes and concurrency against PostgreSQL", { skip: !process.env.DATABASE_URL }, async (t) => {
+  const casePattern = process.env.FINAL_SUBMISSIONS_CASE ? new RegExp(process.env.FINAL_SUBMISSIONS_CASE) : null
+  const scenario = (name, fn) => t.test(name, { skip: casePattern !== null && !casePattern.test(name) }, fn)
   const schema = `final_test_${randomUUID().replaceAll("-", "")}`
-  const db = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 8, connectionTimeoutMillis: 10000 })
+  // Remote test databases can take longer to establish the extra connections
+  // used by course reports; keep the timeout separate from execution behavior.
+  const db = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 8, connectionTimeoutMillis: 30000 })
   const sqlForTest = (sql) => sql.replaceAll("public.", `${schema}.`)
-  const query = (sql, values) => db.query(sqlForTest(sql), values)
+  const query = async (sql, values) => {
+    try { return await db.query(sqlForTest(sql), values) }
+    catch (error) {
+      t.diagnostic(`PostgreSQL query failed: ${error.code ?? error.message}`)
+      throw error
+    }
+  }
   const teacher = { id: randomUUID(), role: "teacher" }
   const otherTeacher = { id: randomUUID(), role: "teacher" }
   const student = { id: randomUUID(), role: "student" }
@@ -33,7 +43,10 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
   let crashConnection = false
   let activeClient
   const executed = []
-  const passed = () => ({ status: "ok", score: 100, passed: 1, failed: 0, ran: 1, total: 1, tests: [{ name: hidden, passed: true, status: "passed", stdout: hidden }] })
+  const testResult = (fields = {}) => ({ index: 1, name: hidden, display_name: hidden, duration_ms: 1, ...fields })
+  const passed = () => ({ status: "ok", score: 100, passed: 1, failed: 0, ran: 1, total: 1,
+    stdout: "", stdout_truncated: false, duration_ms: 10,
+    tests: [testResult({ passed: true, status: "passed", stdout: hidden })] })
 
   function handlers(user) {
     const cache = new Map()
@@ -63,7 +76,12 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
                 throw new Error("Simulated worker connection loss")
               }
               if (destroyed) throw new Error("Connection closed")
-              const result = await client.query(sqlForTest(sql), values)
+              let result
+              try { result = await client.query(sqlForTest(sql), values) }
+              catch (error) {
+                t.diagnostic(`PostgreSQL transaction query failed: ${error.code ?? error.message}`)
+                throw error
+              }
               if (loseCommit && sql === "COMMIT") {
                 loseCommit = false
                 throw new Error("Simulated lost commit acknowledgement")
@@ -109,8 +127,8 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
   }
   const context = (id) => ({ params: Promise.resolve({ id }) })
   const get = () => new Request("http://localhost/api/test")
-  function submit(h, labId, key = randomUUID(), code = fixtureCode) {
-    return h.submit.POST(new Request("http://localhost/api/test", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body: JSON.stringify({ code }) }), context(labId))
+  function submit(h, labId, key = randomUUID(), code = fixtureCode, submitAnyway = false) {
+    return h.submit.POST(new Request("http://localhost/api/test", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body: JSON.stringify({ code, submit_anyway: submitAnyway }) }), context(labId))
   }
   async function makeLab(allow = false, course = courseId, owner = teacher.id) {
     const result = await query("INSERT INTO public.labs (teacher_id, course_id, title, instructions, starter, tests, solution, allow_resubmissions, max_submissions) VALUES ($1,$2,'Fixture','Instructions','pass',$3,'pass',$4,$5) RETURNING id", [owner, course, hidden, allow, allow ? null : 1])
@@ -141,7 +159,9 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
     const legacyUnlimited = (await query("INSERT INTO public.labs (teacher_id,course_id,title,instructions,starter,tests,solution,allow_resubmissions) VALUES ($1,$2,'Legacy unlimited','Read','pass',$3,'pass',true) RETURNING id", [teacher.id, courseId, hidden])).rows[0].id
     await query(readFileSync(path.join(root, "db/migrations/20261127_003_submission_limits.sql"), "utf8"))
     await query(readFileSync(path.join(root, "db/migrations/20261127_004_lab_validation.sql"), "utf8"))
-    await t.test("migration preserves existing runs as practice and defaults old labs to locked policy", async () => {
+    await query(readFileSync(path.join(root, "db/migrations/20261128_001_runner_output.sql"), "utf8"))
+    await query(readFileSync(path.join(root, "db/migrations/20261128_002_submit_anyway.sql"), "utf8"))
+    await scenario("migration preserves existing runs as practice and defaults old labs to locked policy", async () => {
       const legacy = await query("SELECT l.allow_resubmissions,s.kind,s.code FROM public.labs l JOIN public.submissions s ON s.lab_id=l.id WHERE l.id=$1", [legacyLab])
       assert.equal(legacy.rows[0].allow_resubmissions, false)
       assert.equal(legacy.rows[0].kind, "practice")
@@ -152,6 +172,8 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       const audit = await query("SELECT validated_at,validation_summary FROM public.labs WHERE id=$1", [legacyLab])
       assert.equal(audit.rows[0].validated_at, null)
       assert.equal(audit.rows[0].validation_summary, null)
+      assert.equal((await query("SELECT execution_output FROM public.submissions WHERE lab_id=$1", [legacyLab])).rows[0].execution_output, null)
+      assert.equal((await query("SELECT submit_anyway FROM public.submissions WHERE lab_id=$1", [legacyLab])).rows[0].submit_anyway, false)
     })
     const learner = handlers(student)
     const owner = handlers(teacher)
@@ -161,7 +183,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
     const privateLab = await makeLab(true, otherCourseId, otherTeacher.id)
     let acceptedId
 
-    await t.test("passing practice never submits, and Submit verifies the current code again", async () => {
+    await scenario("passing practice never submits, and Submit verifies the current code again", async () => {
       const lab = await makeLab(true)
       const initial = await (await learner.status.GET(get(), context(lab))).json()
       assert.equal(initial.accepted_submission, null)
@@ -173,7 +195,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal(practice.status, 200)
       assert.equal((await (await learner.status.GET(get(), context(lab))).json()).accepted_submission, null)
       const before = runnerCalls
-      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [{ passed: false, status: "failed", error_message: hidden }] })
+      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [testResult({ passed: false, status: "failed", error_message: hidden })] })
       try {
         const response = await submit(learner, lab, randomUUID(), "def add(a, b):\n    return 0\n")
         assert.equal(response.status, 200)
@@ -182,13 +204,13 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
         assert.equal(body.submitted_at, null)
         assert.equal(runnerCalls, before + 1)
         assert.equal(executed.at(-1).code, "def add(a, b):\n    return 0\n")
-        assert.ok(!JSON.stringify(body).includes(hidden))
+        assert.equal(body.execution.tests[0].error_message, hidden)
         const rows = await query("SELECT kind FROM public.submissions WHERE lab_id=$1", [lab])
         assert.deepEqual(rows.rows, [{ kind: "practice" }])
       } finally { runnerBehavior = undefined }
     })
 
-    await t.test("upload requires explicit true/false and lab details expose the setting", async () => {
+    await scenario("upload requires explicit true/false and lab details expose the setting", async () => {
       function form(value) {
         const data = new FormData()
         data.set("course_id", courseId)
@@ -218,7 +240,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       }
     })
 
-    await t.test("passing Submit persists exact verified source and replays after lock", async () => {
+    await scenario("passing Submit persists exact verified source and replays after lock", async () => {
       const key = randomUUID()
       const response = await submit(learner, lockedLab, key)
       assert.equal(response.status, 200)
@@ -228,7 +250,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.ok(body.submitted_at)
       assert.equal(executed.at(-1).code, fixtureCode)
       assert.equal(executed.at(-1).tests, hidden)
-      assert.ok(!JSON.stringify(body).includes(hidden))
+      assert.equal(body.execution.tests[0].stdout, hidden)
       const before = runnerCalls
       assert.deepEqual(await (await submit(learner, lockedLab, key)).json(), body)
       assert.equal(runnerCalls, before)
@@ -243,16 +265,17 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal(status.can_submit, false)
       assert.equal(status.accepted_submission.submission_id, acceptedId)
       assert.equal(status.accepted_submission.code_sha256, createHash("sha256").update(fixtureCode).digest("hex"))
+      assert.deepEqual(status.accepted_submission.execution, body.execution)
       const inspection = await owner.inspect.GET(get(), { params: Promise.resolve({ submissionId: acceptedId }) })
       const saved = await inspection.json()
       assert.equal(saved.code, fixtureCode)
       assert.deepEqual(saved.execution, body.execution)
     })
 
-    await t.test("failed execution replays without locking and a new key can pass", async () => {
+    await scenario("failed execution replays without locking and a new key can pass", async () => {
       const lab = await makeLab()
       const key = randomUUID()
-      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [{ name: hidden, passed: false, status: "failed", error_message: hidden }] })
+      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [testResult({ passed: false, status: "failed", error_message: hidden })] })
       const rejected = await (await submit(learner, lab, key)).json()
       assert.equal(rejected.accepted, false)
       assert.equal(rejected.submission_id, null)
@@ -264,9 +287,9 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal((await (await submit(learner, lab)).json()).accepted, true)
     })
 
-    await t.test("syntax/runtime/timeouts/OOM and zero tests never accept", async () => {
+    await scenario("syntax/runtime/timeouts/OOM and zero tests never accept", async () => {
       for (const status of ["syntax_error", "runtime_error", "timeout", "oom", "ok"]) {
-        runnerBehavior = () => ({ status, score: 0, ran: 0, passed: 0, failed: 0, total: 0, tests: [] })
+        runnerBehavior = () => ({ ...passed(), status, score: 0, ran: 0, passed: 0, failed: 0, total: 0, tests: [] })
         const response = await submit(learner, repeatLab)
         assert.equal(response.status, status === "ok" ? 422 : 200)
         if (status !== "ok") assert.equal((await response.json()).accepted, false)
@@ -274,7 +297,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       runnerBehavior = undefined
     })
 
-    await t.test("allowed resubmissions preserve versions and replay the original version", async () => {
+    await scenario("allowed resubmissions preserve versions and replay the original version", async () => {
       const key = randomUUID()
       const first = await (await submit(learner, repeatLab, key)).json()
       const second = await (await submit(learner, repeatLab, randomUUID(), `${fixtureCode}\n`)).json()
@@ -285,7 +308,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal(status.can_submit, true)
       assert.equal(status.accepted_submission.version, 2)
       assert.equal(status.accepted_submission.submission_id, second.submission_id)
-      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [{ passed: false, status: "failed" }] })
+      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [testResult({ passed: false, status: "failed" })] })
       try {
         assert.equal((await (await submit(learner, repeatLab)).json()).accepted, false)
         const afterFailure = await (await learner.status.GET(get(), context(repeatLab))).json()
@@ -293,7 +316,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       } finally { runnerBehavior = undefined }
     })
 
-    await t.test("concurrent same/different keys serialize and preserve the lock rule", async () => {
+    await scenario("concurrent same/different keys serialize and preserve the lock rule", async () => {
       const lab = await makeLab()
       const key = randomUUID()
       let signalStarted
@@ -317,7 +340,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal(count.rows[0].count, 1)
     })
 
-    await t.test("save failure, lost commit acknowledgement and connection loss recover", async () => {
+    await scenario("save failure, lost commit acknowledgement and connection loss recover", async () => {
       for (const failure of ["save", "commit", "crash"]) {
         const lab = await makeLab()
         const key = randomUUID()
@@ -337,7 +360,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.ok(activeClient)
     })
 
-    await t.test("authorization and course-scoped reports exclude unrelated activity", async () => {
+    await scenario("authorization and course-scoped reports exclude unrelated activity", async () => {
       assert.equal((await submit(handlers(undefined), repeatLab)).status, 401)
       assert.equal((await submit(owner, repeatLab)).status, 403)
       assert.equal((await submit(handlers(outsider), repeatLab)).status, 404)
@@ -364,7 +387,117 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal(activity.submissions.filter((s) => s.kind === "practice").length, 2)
     })
 
-    await t.test("database constraints reject a failed final and enforce locked labs", async () => {
+    await scenario("Submit anyway saves unfinished work for teacher review and consumes one slot", async () => {
+      const lab = await makeLab()
+      const code = "def add(a, b):\n    return a - b\n"
+      const key = randomUUID()
+      runnerBehavior = () => ({ ...passed(), score: 50, passed: 1, failed: 1, ran: 2, total: 2,
+        tests: [testResult({ passed: true, status: "passed" }), testResult({ index: 2, passed: false, status: "failed", error_message: "Wrong result" })] })
+      try {
+        const rejected = await (await submit(learner, lab, key, code)).json()
+        assert.equal(rejected.accepted, false)
+        assert.equal(rejected.submission_status, null)
+        const beforeMismatch = runnerCalls
+        const mismatch = await submit(learner, lab, key, code, true)
+        assert.equal(mismatch.status, 409)
+        assert.equal((await mismatch.json()).code, "IDEMPOTENCY_KEY_REUSED")
+        assert.equal(runnerCalls, beforeMismatch)
+        const reviewKey = randomUUID()
+        const accepted = await (await submit(learner, lab, reviewKey, code, true)).json()
+        assert.equal(accepted.accepted, true)
+        assert.equal(accepted.submit_anyway, true)
+        assert.equal(accepted.submission_status, "pending_review")
+        assert.equal(accepted.execution.score, 50)
+        assert.equal(runnerCalls, beforeMismatch + 1)
+        assert.equal(executed.at(-1).code, code)
+        assert.deepEqual(await (await submit(learner, lab, reviewKey, code, true)).json(), accepted)
+        const status = await (await learner.status.GET(get(), context(lab))).json()
+        assert.equal(status.can_submit, false)
+        assert.equal(status.accepted_submission_count, 1)
+        assert.equal(status.accepted_submission.submission_status, "pending_review")
+        assert.equal(status.accepted_submission.submit_anyway, true)
+        const inspection = await (await owner.inspect.GET(get(), { params: Promise.resolve({ submissionId: accepted.submission_id }) })).json()
+        assert.equal(inspection.code, code)
+        assert.equal(inspection.submission_status, "pending_review")
+        assert.deepEqual(inspection.execution, accepted.execution)
+        assert.equal((await unrelated.inspect.GET(get(), { params: Promise.resolve({ submissionId: accepted.submission_id }) })).status, 404)
+        const overviewResponse = await owner.overview.GET(get(), { params: Promise.resolve({ id: courseId, studentId: student.id }) })
+        assert.equal(overviewResponse.status, 200)
+        const report = await overviewResponse.json()
+        assert.equal(report.labs.find((l) => l.lab_id === lab).accepted_submission.submission_status, "pending_review")
+        const timeline = await (await owner.report.GET(get(), context(lab))).json()
+        assert.equal(timeline.students.find((s) => s.student_id === student.id).first_pass_at, null)
+        assert.equal(timeline.students.find((s) => s.student_id === student.id).submissions[0].submit_anyway, true)
+        assert.equal((await (await submit(learner, lab, randomUUID(), code, true)).json()).code, "FINAL_SUBMISSION_LOCKED")
+      } finally { runnerBehavior = undefined }
+    })
+
+    await scenario("Submit anyway accepts execution errors but never service failures or empty test suites", async () => {
+      const lab = await makeLab(true)
+      try {
+        for (const status of ["syntax_error", "runtime_error", "timeout", "oom"]) {
+          runnerBehavior = () => ({ ...passed(), status, score: 0, ran: 0, passed: 0, failed: 0, total: 0, tests: [] })
+          const response = await submit(learner, lab, randomUUID(), fixtureCode, true)
+          assert.equal(response.status, 200)
+          const body = await response.json()
+          assert.equal(body.accepted, true)
+          assert.equal(body.submission_status, "pending_review")
+          assert.equal(body.execution.status, status)
+        }
+        for (const [status, http] of [["ok", 422], ["internal_error", 502]]) {
+          runnerBehavior = () => ({ ...passed(), status, score: 0, ran: 0, passed: 0, failed: 0, total: 0, tests: [] })
+          assert.equal((await submit(learner, lab, randomUUID(), fixtureCode, true)).status, http)
+        }
+        runnerBehavior = () => { throw new Error("Runner unavailable") }
+        assert.equal((await submit(learner, lab, randomUUID(), fixtureCode, true)).status, 502)
+        assert.equal((await (await learner.status.GET(get(), context(lab))).json()).accepted_submission_count, 4)
+        runnerBehavior = undefined
+        const before = runnerCalls
+        assert.equal((await submit(owner, lab, randomUUID(), fixtureCode, true)).status, 403)
+        assert.equal((await submit(handlers(outsider), lab, randomUUID(), fixtureCode, true)).status, 404)
+        assert.equal(runnerCalls, before)
+        const passedAnyway = await (await submit(learner, lab, randomUUID(), fixtureCode, true)).json()
+        assert.equal(passedAnyway.submission_status, "passed")
+        assert.equal(passedAnyway.submit_anyway, true)
+        assert.equal((await (await learner.status.GET(get(), context(lab))).json()).accepted_submission_count, 5)
+      } finally { runnerBehavior = undefined }
+    })
+
+    await scenario("Submit anyway recovers after save failure and serializes concurrent retries", async () => {
+      const lab = await makeLab()
+      const key = randomUUID()
+      const failed = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [testResult({ passed: false, status: "failed" })] })
+      runnerBehavior = failed
+      failOutcome = true
+      try {
+        assert.equal((await submit(learner, lab, key, fixtureCode, true)).status, 500)
+        assert.equal((await (await learner.status.GET(get(), context(lab))).json()).accepted_submission, null)
+        let startedResolve, finishResolve
+        const started = new Promise((resolve) => { startedResolve = resolve })
+        runnerBehavior = async () => { startedResolve(); await new Promise((resolve) => { finishResolve = resolve }); return failed() }
+        const first = submit(learner, lab, key, fixtureCode, true)
+        await started
+        try {
+          for (const otherKey of [key, randomUUID()]) {
+            assert.equal((await (await submit(learner, lab, otherKey, fixtureCode, true)).json()).code, "SUBMISSION_PROCESSING")
+          }
+        } finally { finishResolve() }
+        const accepted = await (await first).json()
+        assert.equal(accepted.submission_status, "pending_review")
+        assert.deepEqual(await (await submit(learner, lab, key, fixtureCode, true)).json(), accepted)
+        assert.equal((await query("SELECT count(*)::int AS count FROM public.submissions WHERE lab_id=$1 AND kind='final'", [lab])).rows[0].count, 1)
+      } finally { runnerBehavior = undefined; failOutcome = false }
+    })
+
+    await scenario("Submit anyway database guard binds intent and rejects zero discovered tests", async () => {
+      const lab = await makeLab(true)
+      const request = await query("INSERT INTO public.submission_requests (lab_id,student_id,idempotency_key,code) VALUES ($1,$2,$3,'pass') RETURNING id", [lab, student.id, randomUUID()])
+      await assert.rejects(query("INSERT INTO public.submissions (lab_id,student_id,code,status,results,score,passed,total,kind,request_id,code_sha256,submit_anyway) VALUES ($1,$2,'pass','runtime_error','[]',0,0,0,'final',$3,$4,true)", [lab, student.id, request.rows[0].id, "0".repeat(64)]), { code: "23514" })
+      const review = await query("INSERT INTO public.submission_requests (lab_id,student_id,idempotency_key,code,submit_anyway) VALUES ($1,$2,$3,'pass',true) RETURNING id", [lab, student.id, randomUUID()])
+      await assert.rejects(query("INSERT INTO public.submissions (lab_id,student_id,code,status,results,score,passed,total,kind,request_id,code_sha256,submit_anyway) VALUES ($1,$2,'pass','ok','[]',0,0,0,'final',$3,$4,true)", [lab, student.id, review.rows[0].id, "0".repeat(64)]), { code: "23514", constraint: "submissions_final_valid" })
+    })
+
+    await scenario("database constraints reject a failed final and enforce locked labs", async () => {
       const key = randomUUID()
       const request = await query("INSERT INTO public.submission_requests (lab_id,student_id,idempotency_key,code) VALUES ($1,$2,$3,'pass') RETURNING id", [repeatLab, student.id, key])
       await assert.rejects(query("INSERT INTO public.submissions (lab_id,student_id,code,status,results,score,passed,total,kind,request_id,code_sha256) VALUES ($1,$2,'pass','ok','[]',0,0,0,'final',$3,$4)", [repeatLab, student.id, request.rows[0].id, "0".repeat(64)]), { code: "23514" })
@@ -372,7 +505,39 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       await assert.rejects(query("INSERT INTO public.submissions (lab_id,student_id,code,status,results,score,passed,total,kind,request_id,code_sha256) VALUES ($1,$2,'pass','ok','[{\"name\":\"Test 1\",\"passed\":true,\"error\":null}]',100,1,1,'final',$3,$4)", [lockedLab, student.id, lockedRequest.rows[0].id, "0".repeat(64)]), { code: "23514", constraint: "final_submission_locked" })
     })
 
-    await t.test("numeric upload limits and owner-only changes are validated", async () => {
+    await scenario("complete diagnostics and control-character output survive persistence, replay and reload", async () => {
+      const lab = await makeLab(true)
+      const stdout = "first\u0000second\nسلام 😀\n"
+      const syntax = { error_type: "SyntaxError", error_message: "expected ':'", line: 1, code_line: "def add(a,b)" }
+      runnerBehavior = () => ({ ...passed(), status: "syntax_error", score: 0, passed: 0, failed: 0, ran: 0, total: 0, tests: [], stdout, syntax_error: syntax })
+      try {
+        const practice = await learner.run.POST(new Request("http://localhost", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: fixtureCode }) }), context(lab))
+        assert.equal(practice.status, 200)
+        const body = await practice.json()
+        assert.equal(body.stdout, stdout)
+        assert.deepEqual(body.syntax_error, syntax)
+        assert.deepEqual((await query("SELECT execution_output FROM public.submissions WHERE lab_id=$1 AND kind='practice'", [lab])).rows[0].execution_output, body)
+        const failedKey = randomUUID()
+        const failed = await (await submit(learner, lab, failedKey)).json()
+        assert.equal(failed.accepted, false)
+        assert.deepEqual(failed.execution, body)
+        assert.deepEqual(await (await submit(learner, lab, failedKey)).json(), failed)
+        runnerBehavior = () => ({ ...passed(), stdout, tests: [testResult({ passed: true, status: "passed", stdout, stdout_truncated: true, inputs: "x=1", expected: "2", actual: "2" })] })
+        const key = randomUUID()
+        const accepted = await (await submit(learner, lab, key)).json()
+        assert.equal(accepted.accepted, true)
+        assert.equal(accepted.execution.tests[0].stdout, stdout)
+        assert.deepEqual(await (await submit(learner, lab, key)).json(), accepted)
+        const reloaded = await learner.status.GET(get(), context(lab))
+        assert.equal(reloaded.status, 200)
+        assert.deepEqual((await reloaded.json()).accepted_submission.execution, accepted.execution)
+        const inspection = await owner.inspect.GET(get(), { params: Promise.resolve({ submissionId: accepted.submission_id }) })
+        assert.equal(inspection.status, 200)
+        assert.deepEqual((await inspection.json()).execution, accepted.execution)
+      } finally { runnerBehavior = undefined }
+    })
+
+    await scenario("numeric upload limits and owner-only changes are validated", async () => {
       const form = new FormData()
       form.set("course_id", courseId)
       form.set("title", "Limited upload")
@@ -396,7 +561,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       }
     })
 
-    await t.test("finite limits count accepted finals only and permit recovery after increasing the limit", async () => {
+    await scenario("finite limits count accepted finals only and permit recovery after increasing the limit", async () => {
       const lab = await makeLab(true)
       const patch = (limit) => owner.detail.PATCH(new Request("http://localhost", {
         method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ max_submissions: limit }),
@@ -404,7 +569,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal((await patch(2)).status, 200)
       const firstKey = randomUUID()
       const first = await (await submit(learner, lab, firstKey)).json()
-      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [{ passed: false, status: "failed" }] })
+      runnerBehavior = () => ({ ...passed(), passed: 0, failed: 1, score: 0, tests: [testResult({ passed: false, status: "failed" })] })
       try { assert.equal((await (await submit(learner, lab)).json()).accepted, false) }
       finally { runnerBehavior = undefined }
       const afterFailure = await (await learner.status.GET(get(), context(lab))).json()
@@ -448,7 +613,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal(report.students.find((s) => s.student_id === student.id).accepted_submission_count, 3)
     })
 
-    await t.test("revoked enrollment prevents status and replay while the owner retains historical access", async () => {
+    await scenario("revoked enrollment prevents status and replay while the owner retains historical access", async () => {
       const lab = await makeLab(true)
       const key = randomUUID()
       const accepted = await (await submit(learner, lab, key)).json()
@@ -463,7 +628,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       assert.equal((await report.json()).labs.find((item) => item.lab_id === lab).accepted_submission.submission_id, accepted.submission_id)
     })
 
-    await t.test("invalid uploads and database failure after successful validation leave no lab", async () => {
+    await scenario("invalid uploads and database failure after successful validation leave no lab", async () => {
       const before = (await query("SELECT count(*)::int AS count FROM public.labs")).rows[0].count
       const upload = () => {
         const form = new FormData()

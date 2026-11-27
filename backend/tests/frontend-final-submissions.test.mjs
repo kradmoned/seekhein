@@ -47,6 +47,28 @@ test("separate pending keys do not overwrite each other", async () => {
   await h.context.sendSubmission("student", "lab", first, async () => "token")
   assert.equal(h.storage.size, 1)
 })
+test("Submit anyway uses a new key and preserves its mode through recovery", async () => {
+  const h = harness()
+  const regular = h.context.beginSubmission("student", "lab", "unfinished code")
+  const anyway = h.context.beginSubmission("student", "lab", "unfinished code", true)
+  assert.notEqual(anyway.key, regular.key)
+  h.setResponse({ status: 500, body: { code: "SUBMISSION_SAVE_FAILED" } })
+  await h.context.sendSubmission("student", "lab", anyway, async () => "token")
+  const recovered = [...h.storage.values()].map(JSON.parse).find((p) => p.key === anyway.key)
+  assert.equal(recovered.submit_anyway, true)
+  h.setResponse({ status: 200, body: { accepted: true, submission_status: "pending_review" } })
+  await h.context.sendSubmission("student", "lab", recovered, async () => "token")
+  assert.equal(h.storage.size, 1)
+  for (const request of h.requests) {
+    assert.equal(request.headers["Idempotency-Key"], anyway.key)
+    assert.deepEqual(JSON.parse(request.body), { code: anyway.code, submit_anyway: true })
+  }
+})
+test("historical pending actions recover using ordinary submission mode", async () => {
+  const h = harness()
+  await h.context.sendSubmission("student", "lab", { key: randomUUID(), code: "pass" }, async () => "token")
+  assert.deepEqual(JSON.parse(h.requests[0].body), { code: "pass", submit_anyway: false })
+})
 test("a terminal numeric-limit rejection clears only its pending action", async () => {
   const h = harness()
   const pending = h.context.beginSubmission("student", "lab", "one")
