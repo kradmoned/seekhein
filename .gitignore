@@ -1,0 +1,12 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# ChromaDB
+chroma_db/
+**/chroma_db/
+
+# Lab manuals (course materials)
+knowledge_base/lab_manuals/
