@@ -102,6 +102,15 @@ export async function runCode(code: string, tests: string) {
     throw new RunnerError(422, "This lab exceeds the runner's test size limit. Contact your teacher.")
   }
 
+  return studentResult((await requestRunner("/run?view=student", { code, tests })).data)
+}
+
+// Only server-chosen paths and source are sent. Browser credentials and raw
+// infrastructure error bodies must never pass through this boundary.
+export async function requestRunner(
+  endpoint: "/run?view=student" | "/validate",
+  payload: { code: string; tests: string } | { solution: string; tests: string },
+) {
   let url: URL
   try {
     const base = new URL(process.env.RUNNER_URL ?? "")
@@ -112,12 +121,12 @@ export async function runCode(code: string, tests: string) {
     ) {
       throw new Error("Invalid runner origin")
     }
-    url = new URL("/run?view=student", base)
+    url = new URL(endpoint, base)
   } catch {
     throw new RunnerError(503, "Code runner is not configured")
   }
 
-  const body = JSON.stringify({ code, tests })
+  const body = JSON.stringify(payload)
   if (Buffer.byteLength(body, "utf8") > maxRequestBytes) {
     throw new RunnerError(413, "Combined code and tests exceed the runner request limit")
   }
@@ -138,7 +147,7 @@ export async function runCode(code: string, tests: string) {
       redirect: "error",
     })
 
-    if (!response.ok) {
+    if (response.status !== 200 && !(endpoint === "/validate" && response.status === 422)) {
       // Never forward upstream error bodies: they may contain test contents.
       await response.body?.cancel()
       if (response.status === 429) {
@@ -147,10 +156,13 @@ export async function runCode(code: string, tests: string) {
       if (response.status === 503) {
         throw new RunnerError(503, "Code runner is unavailable")
       }
+      if (endpoint === "/validate" && response.status === 413) {
+        throw new RunnerError(413, "Lab source exceeds the code runner's request limit")
+      }
       throw new RunnerError(502, "Code runner rejected the request")
     }
 
-    return studentResult(await readJsonBody(response, maxResponseBytes))
+    return { httpStatus: response.status, data: await readJsonBody(response, maxResponseBytes) }
   } catch (error) {
     if (error instanceof RunnerError) throw error
     if (signal.aborted) {

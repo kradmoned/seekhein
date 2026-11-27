@@ -27,6 +27,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
   const hidden = "PRIVATE_TEST_SENTINEL"
   let runnerCalls = 0
   let runnerBehavior
+  let validationResponse
   let failOutcome = false
   let loseCommit = false
   let crashConnection = false
@@ -81,6 +82,12 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
         exports, Request, Response, URL, File, Buffer, TextDecoder, AbortSignal, console: { error() {} },
         process: { env: { RUNNER_URL: "http://runner.test" } },
         fetch: async (_url, init) => {
+          if (new URL(_url).pathname === "/validate") return validationResponse ?? Response.json({
+            valid: true, status: "ok", summary: "All tests passed", duration_ms: 1,
+            total_tests: 1, ran_tests: 1, passed_tests: 1, failed_tests: 0,
+            tests: [{ index: 1, name: hidden, display_name: hidden, status: "passed", passed: true, duration_ms: 1 }],
+            warnings: [hidden],
+          })
           runnerCalls++
           executed.push(JSON.parse(init.body))
           return Response.json(runnerBehavior ? await runnerBehavior() : passed())
@@ -118,6 +125,8 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
     }
     await db.query(`ALTER TABLE ${schema}.labs DROP COLUMN IF EXISTS max_submissions`)
     await db.query(`ALTER TABLE ${schema}.labs DROP COLUMN IF EXISTS allow_resubmissions`)
+    await db.query(`ALTER TABLE ${schema}.labs DROP COLUMN IF EXISTS validated_at`)
+    await db.query(`ALTER TABLE ${schema}.labs DROP COLUMN IF EXISTS validation_summary`)
     for (const file of ["20261127_001_integrity.sql"]) {
       await query(readFileSync(path.join(root, "db/migrations", file), "utf8"))
     }
@@ -131,6 +140,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
     await query(readFileSync(path.join(root, "db/migrations/20261127_002_final_submissions.sql"), "utf8"))
     const legacyUnlimited = (await query("INSERT INTO public.labs (teacher_id,course_id,title,instructions,starter,tests,solution,allow_resubmissions) VALUES ($1,$2,'Legacy unlimited','Read','pass',$3,'pass',true) RETURNING id", [teacher.id, courseId, hidden])).rows[0].id
     await query(readFileSync(path.join(root, "db/migrations/20261127_003_submission_limits.sql"), "utf8"))
+    await query(readFileSync(path.join(root, "db/migrations/20261127_004_lab_validation.sql"), "utf8"))
     await t.test("migration preserves existing runs as practice and defaults old labs to locked policy", async () => {
       const legacy = await query("SELECT l.allow_resubmissions,s.kind,s.code FROM public.labs l JOIN public.submissions s ON s.lab_id=l.id WHERE l.id=$1", [legacyLab])
       assert.equal(legacy.rows[0].allow_resubmissions, false)
@@ -139,6 +149,9 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       const limits = await query("SELECT id,max_submissions FROM public.labs WHERE id IN ($1,$2)", [legacyLab, legacyUnlimited])
       assert.equal(limits.rows.find((row) => row.id === legacyLab).max_submissions, 1)
       assert.equal(limits.rows.find((row) => row.id === legacyUnlimited).max_submissions, null)
+      const audit = await query("SELECT validated_at,validation_summary FROM public.labs WHERE id=$1", [legacyLab])
+      assert.equal(audit.rows[0].validated_at, null)
+      assert.equal(audit.rows[0].validation_summary, null)
     })
     const learner = handlers(student)
     const owner = handlers(teacher)
@@ -192,8 +205,16 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
         const response = await owner.upload.POST(new Request("http://localhost", { method: "POST", body: form(value) }))
         assert.equal(response.status, 201)
         const lab = await response.json()
+        assert.ok(lab.validated_at)
+        assert.equal(lab.validation.valid, true)
         const detail = await learner.detail.GET(get(), context(lab.id))
-        assert.equal((await detail.json()).allow_resubmissions, value === "true")
+        const studentDetail = await detail.json()
+        assert.equal(studentDetail.allow_resubmissions, value === "true")
+        assert.equal(studentDetail.validation, undefined)
+        assert.ok(!JSON.stringify(studentDetail).includes(hidden))
+        const teacherDetail = await (await owner.detail.GET(get(), context(lab.id))).json()
+        assert.deepEqual(teacherDetail.validation, lab.validation)
+        assert.ok(teacherDetail.validated_at)
       }
     })
 
@@ -440,6 +461,29 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       const report = await owner.overview.GET(get(), { params: Promise.resolve({ id: courseId, studentId: student.id }) })
       assert.equal(report.status, 200)
       assert.equal((await report.json()).labs.find((item) => item.lab_id === lab).accepted_submission.submission_id, accepted.submission_id)
+    })
+
+    await t.test("invalid uploads and database failure after successful validation leave no lab", async () => {
+      const before = (await query("SELECT count(*)::int AS count FROM public.labs")).rows[0].count
+      const upload = () => {
+        const form = new FormData()
+        form.set("title", "Reject save fixture"); form.set("course_id", courseId); form.set("max_submissions", "1")
+        for (const field of ["instructions", "starter", "tests", "solution"]) form.set(field, new File(["pass"], `${field}.py`))
+        return owner.upload.POST(new Request("http://localhost", { method: "POST", body: form }))
+      }
+      validationResponse = Response.json({ valid: false, status: "ok", summary: "No tests found", duration_ms: 1,
+        total_tests: 0, ran_tests: 0, passed_tests: 0, failed_tests: 0, tests: [] }, { status: 422 })
+      assert.equal((await upload()).status, 422)
+      validationResponse = undefined
+      await query(`CREATE FUNCTION public.reject_upload_fixture() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.title = 'Reject save fixture' THEN RAISE EXCEPTION 'Simulated storage failure'; END IF; RETURN NEW; END; $$;
+        CREATE TRIGGER reject_upload_fixture BEFORE INSERT ON public.labs FOR EACH ROW EXECUTE FUNCTION public.reject_upload_fixture();`)
+      try {
+        assert.equal((await upload()).status, 500)
+        assert.equal((await query("SELECT count(*)::int AS count FROM public.labs")).rows[0].count, before)
+      } finally {
+        await query("DROP TRIGGER reject_upload_fixture ON public.labs; DROP FUNCTION public.reject_upload_fixture()")
+      }
     })
   } finally {
     runnerBehavior = undefined

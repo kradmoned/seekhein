@@ -16,6 +16,8 @@ type Lab = {
   allow_resubmissions: boolean
   max_submissions: number | null
   course_id: string
+  validated_at: string | null
+  validation_summary: Record<string, unknown> | null
 }
 
 export async function GET(
@@ -38,7 +40,8 @@ export async function GET(
 
   try {
     const result = await pool.query<Lab>(
-      `SELECT l.id, l.title, l.instructions, l.starter, l.course_id, l.allow_resubmissions, l.max_submissions
+      `SELECT l.id, l.title, l.instructions, l.starter, l.course_id, l.allow_resubmissions, l.max_submissions,
+         l.validated_at, l.validation_summary
        FROM public.labs l JOIN public.courses c ON c.id = l.course_id
        WHERE ${courseAccessSql} AND l.id = $3`,
       [user.id, user.role, id],
@@ -63,6 +66,7 @@ export async function GET(
         allow_resubmissions: lab.allow_resubmissions,
         max_submissions: lab.max_submissions,
         integrity_policy: integrityPolicy,
+        ...(user.role === "teacher" ? { validated_at: lab.validated_at, validation: lab.validation_summary } : {}),
       },
       { headers: { "Cache-Control": "private, no-store" } },
     )

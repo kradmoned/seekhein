@@ -22,7 +22,7 @@ return `403` for students. Successful reads use `Cache-Control: private, no-stor
 | `GET /api/courses/{id}` | — | `{id,teacher_id,title,description,created_at,labs:[{id,title}]}` |
 | `POST /api/courses/{id}/students` | JSON `{"email":"student@example.com"}` | `200 {course_id,student_id,enrolled_at}` |
 | `GET /api/courses/{id}/students` | — | Owner-only array of `{id,email,full_name,enrolled_at}` |
-| `POST /api/labs` | Existing multipart fields plus `course_id` and `max_submissions` | `201 {"id":"<uuid>"}` |
+| `POST /api/labs` | Existing multipart fields plus `course_id` and `max_submissions`; validates reference solution before saving | `201 {id, validated_at, validation}` |
 | `GET /api/labs?course_id={id}` | Optional course filter | Accessible labs as `[{id,title,course_id}]` |
 
 Course titles are trimmed and limited to 1–200 characters. Description is optional,
@@ -210,9 +210,19 @@ Limits and errors (`{"error":"message"}`):
 - `504`: runner HTTP request exceeded 30 seconds, allowing for the documented
   10-second queue wait plus 6-second execution deadline. No automatic retries.
 
-The upload limit remains 1 MiB per file. Consequently a lab may upload
-successfully but exceed the runner's stricter 64 KiB test limit when executed.
-Upload still does not call `/validate` or the runner.
+Uploads allow 1 MiB for instructions and 64 KiB each for starter, tests, and
+reference solution. Before saving, `POST /api/labs` calls CodeRunner `/validate`
+with the reference solution and tests. At least one test must run and all must
+pass. Invalid labs return `422 LAB_VALIDATION_FAILED` with teacher diagnostics;
+runner outages return separate service errors. Warning-only validation passes.
+
+Apply `db/migrations/20261127_004_lab_validation.sql` before deploying this upload
+flow. A saved lab returns `{id, validated_at, validation}` and records a compact
+validation summary. Existing labs remain unvalidated (NULL audit fields). Only
+the course owner receives audit fields in lab detail responses; student APIs
+do not expose teacher diagnostics or warnings. See the
+[teacher validation contract](docs/frontend-lab-validation.md) for exact types,
+error handling, UI behavior, and integration checks.
 
 The current CodeRunner requires `unittest.TestCase` methods. Bare functions and
 the old `expect(...)` format are incompatible. A compatible complete test file is:
@@ -383,7 +393,8 @@ curl -i http://localhost:3000/api/labs \
   -F 'solution=@demo-lab-unittest/solution.py'
 ```
 
-Expected: HTTP `201` with `{"id":"<new-lab-id>"}`. Set `LAB_ID` to that ID.
+Expected: HTTP `201` with `{id, validated_at, validation}` after reference tests
+pass and the lab is saved. Set `LAB_ID` to the returned ID.
 The frontend upload form sends the same fields using `FormData`, with the four
 files selected separately; let the browser set the multipart Content-Type.
 
@@ -404,9 +415,9 @@ as a student, enroll that student in the course and use their access token.
 The local runner must be running at the origin configured by `RUNNER_URL`.
 
 If you see `This lab has no runnable unittest tests`, the runner discovered
-zero tests in the **stored** test file. Upload only checks the file's text,
-size, and required form fields; it does not execute tests or call `/validate`.
-Retrying identical code will not repair an incompatible test file.
+zero tests in the **stored** test file. Legacy labs may contain incompatible
+test files; new uploads are rejected by reference validation when no tests are
+discovered. Retrying identical student code will not repair an incompatible test file.
 
 Fixing a local file does not change an already-uploaded lab. Upload the corrected
 four files as a **new lab** and open the new ID. The lab PATCH endpoint updates

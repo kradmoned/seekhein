@@ -43,6 +43,11 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
       class RunnerError extends Error {}
       return {
         maxSourceBytes: 65536, maxRequestBytes: 524288, RunnerError,
+        requestRunner: async () => ({ httpStatus: 200, data: {
+          valid: true, status: "ok", summary: "All tests passed", duration_ms: 1,
+          total_tests: 1, ran_tests: 1, passed_tests: 1, failed_tests: 0,
+          tests: [{ index: 1, name: "test_a", display_name: "Test A", status: "passed", passed: true, duration_ms: 1 }],
+        } }),
         runCode: async () => {
           runnerCalls++
           return { status: "ok", results: [{ name: "Test 1", passed: true, error: null }], score: 100, passed: 1, total: 1 }
@@ -110,6 +115,12 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
     const limitColumns = await db.query("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'labs' AND column_name = 'max_submissions'")
     if (!limitColumns.rows.length) {
       const migration = readFileSync(path.join(root, "db/migrations/20261127_003_submission_limits.sql"), "utf8")
+      await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
+    }
+
+    const validationColumns = await db.query("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'labs' AND column_name = 'validated_at'")
+    if (!validationColumns.rows.length) {
+      const migration = readFileSync(path.join(root, "db/migrations/20261127_004_lab_validation.sql"), "utf8")
       await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
     }
 

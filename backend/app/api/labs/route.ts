@@ -1,8 +1,10 @@
 import { requireUser } from "../../../lib/auth"
 import { pool } from "../../../lib/db"
 import { courseAccessSql, requireCourse } from "../../../lib/courses"
-import { errorResponse, HttpError, uuidPattern } from "../../../lib/http"
+import { errorResponse, HttpError, privateHeaders, uuidPattern } from "../../../lib/http"
 import { allowsResubmissions, readUploadSubmissionLimit } from "../../../lib/submission-policy"
+import { validateLab, validationSummary } from "../../../lib/lab-validation"
+import { maxSourceBytes, RunnerError } from "../../../lib/runner"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -67,6 +69,7 @@ export async function POST(req: Request) {
   }
 
   const validationErrors: string[] = []
+  let oversized = false
   const titleValue = form.get("title")
   const title = typeof titleValue === "string" ? titleValue.trim() : ""
   const courseValues = form.getAll("course_id")
@@ -109,9 +112,11 @@ export async function POST(req: Request) {
       continue
     }
 
-    if (file.size === 0 || file.size > maxFileBytes) {
+    const byteLimit = field === "instructions" ? maxFileBytes : maxSourceBytes
+    if (file.size === 0 || file.size > byteLimit) {
+      if (file.size > byteLimit) oversized = true
       validationErrors.push(
-        `The ${field} file must be nonempty and at most 1 MiB.`,
+        `The ${field} file must be nonempty and at most ${field === "instructions" ? "1 MiB" : "64 KiB"}.`,
       )
       continue
     }
@@ -126,6 +131,10 @@ export async function POST(req: Request) {
         validationErrors.push(`The ${field} file contains only whitespace.`)
         continue
       }
+      if (contents.includes("\0")) {
+        validationErrors.push(`The ${field} file must not contain null characters.`)
+        continue
+      }
 
       files[field] = contents
     } catch {
@@ -136,12 +145,19 @@ export async function POST(req: Request) {
   if (validationErrors.length > 0) {
     return Response.json(
       { errors: validationErrors },
-      { status: 422 },
+      { status: oversized ? 413 : 422, headers: privateHeaders },
     )
   }
 
   try {
-    const result = await pool.query<{ id: string }>(
+    const validation = await validateLab(files.solution, files.tests)
+    if (!validation.valid) {
+      return Response.json({
+        code: "LAB_VALIDATION_FAILED", error: "The reference solution and tests did not pass lab validation.", validation,
+      }, { status: 422, headers: privateHeaders })
+    }
+    const summary = validationSummary(validation)
+    const result = await pool.query<{ id: string; validated_at: Date }>(
       `INSERT INTO public.labs (
          teacher_id,
          title,
@@ -151,11 +167,13 @@ export async function POST(req: Request) {
          solution,
          course_id,
          allow_resubmissions,
-         max_submissions
+         max_submissions,
+         validated_at,
+         validation_summary
        )
-       SELECT $1, $2, $3, $4, $5, $6, c.id, $8, $9
+       SELECT $1, $2, $3, $4, $5, $6, c.id, $8, $9, statement_timestamp(), $10::jsonb
        FROM public.courses c WHERE c.id = $7 AND c.teacher_id = $1
-       RETURNING id`,
+       RETURNING id, validated_at`,
       [
         user.id,
         title,
@@ -166,6 +184,7 @@ export async function POST(req: Request) {
         courseId,
         allowsResubmissions(maxSubmissions),
         maxSubmissions,
+        JSON.stringify(summary),
       ],
     )
 
@@ -173,10 +192,15 @@ export async function POST(req: Request) {
       return Response.json({ error: "Course not found" }, { status: 404 })
     }
     return Response.json(
-      { id: result.rows[0].id },
-      { status: 201 },
+      { id: result.rows[0].id, validated_at: result.rows[0].validated_at, validation: summary },
+      { status: 201, headers: privateHeaders },
     )
   } catch (error) {
+    if (error instanceof RunnerError) {
+      return Response.json({ code: "LAB_VALIDATION_SERVICE_ERROR", error: error.message }, {
+        status: error.status, headers: { ...privateHeaders, ...(error.status === 429 ? { "Retry-After": "2" } : {}) },
+      })
+    }
     return errorResponse(error, "Unable to save the lab")
   }
 }

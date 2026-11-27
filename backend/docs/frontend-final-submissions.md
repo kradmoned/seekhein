@@ -6,6 +6,10 @@ The backend implements the contracts in this document. Apply
 migrations before serving these routes. Check the implementation handoff for
 actual migration and verification results.
 
+New lab uploads also validate the reference solution against hidden tests before
+saving. See [teacher upload validation](frontend-lab-validation.md) for file
+limits, the expanded HTTP 201 response, teacher diagnostics, and service errors.
+
 ## Teacher submission limit
 
 Use a **Maximum accepted submissions** control with positive integer choices
@@ -337,6 +341,8 @@ Apply each migration once, in this order, to the existing application schema:
    version/digest columns, final-validity constraints, and concurrency guards.
 4. `20261127_003_submission_limits.sql`: positive nullable `max_submissions`,
    legacy-policy backfill, consistency constraint, and numeric database guard.
+5. `20261127_004_lab_validation.sql`: nullable validation timestamp and compact
+   teacher-only audit summary; existing labs remain unvalidated.
 
 Old executions remain practice attempts. Existing false policies become a
 limit of 1; true policies become unlimited. No accepted versions are removed.
