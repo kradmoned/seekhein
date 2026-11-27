@@ -101,6 +101,18 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
       await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
     }
 
+    const finalColumns = await db.query("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'labs' AND column_name = 'allow_resubmissions'")
+    if (!finalColumns.rows.length) {
+      const migration = readFileSync(path.join(root, "db/migrations/20261127_002_final_submissions.sql"), "utf8")
+      await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
+    }
+
+    const limitColumns = await db.query("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'labs' AND column_name = 'max_submissions'")
+    if (!limitColumns.rows.length) {
+      const migration = readFileSync(path.join(root, "db/migrations/20261127_003_submission_limits.sql"), "utf8")
+      await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
+    }
+
     await t.test("authentication precedes body parsing and database access", async () => {
       currentUser = undefined
       const before = queries.length
@@ -119,6 +131,7 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
       const form = new FormData()
       if (id !== undefined) form.set("course_id", id)
       form.set("title", "Temporary lab")
+      form.set("allow_resubmissions", "false")
       for (const name of ["instructions", "starter", "tests", "solution"]) {
         form.set(name, new File([name === "starter" ? "def add(a, b):\n    pass\n" : "PRIVATE_FIXTURE"], `${name}.py`))
       }

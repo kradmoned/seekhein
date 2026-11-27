@@ -22,7 +22,7 @@ return `403` for students. Successful reads use `Cache-Control: private, no-stor
 | `GET /api/courses/{id}` | — | `{id,teacher_id,title,description,created_at,labs:[{id,title}]}` |
 | `POST /api/courses/{id}/students` | JSON `{"email":"student@example.com"}` | `200 {course_id,student_id,enrolled_at}` |
 | `GET /api/courses/{id}/students` | — | Owner-only array of `{id,email,full_name,enrolled_at}` |
-| `POST /api/labs` | Existing multipart fields plus `course_id` | `201 {"id":"<uuid>"}` |
+| `POST /api/labs` | Existing multipart fields plus `course_id` and `max_submissions` | `201 {"id":"<uuid>"}` |
 | `GET /api/labs?course_id={id}` | Optional course filter | Accessible labs as `[{id,title,course_id}]` |
 
 Course titles are trimmed and limited to 1–200 characters. Description is optional,
@@ -62,6 +62,7 @@ curl "http://localhost:3000/api/courses/$COURSE_ID/students" \
 curl -i http://localhost:3000/api/labs \
   -H "Authorization: Bearer $TOKEN" \
   -F "course_id=$COURSE_ID" -F 'title=Addition' \
+  -F 'max_submissions=1' \
   -F 'instructions=@demo-lab/instructions.md' \
   -F 'starter=@demo-lab/starter.py' \
   -F 'tests=@demo-lab/tests.py' \
@@ -72,8 +73,10 @@ curl "http://localhost:3000/api/courses/$COURSE_ID" \
 ```
 
 The bundled `demo-lab/tests.py` uses compatible `unittest.TestCase` methods.
-New uploads require exactly one valid `course_id` field and return `422` when
-it is missing or invalid. The teacher must own the selected course.
+New uploads require exactly one `max_submissions` text field containing a
+positive integer or `unlimited`, and exactly one valid `course_id` field. Missing
+or invalid values return `422`. Legacy `allow_resubmissions=true/false` is also
+accepted instead of the numeric field. The teacher must own the selected course.
 
 The course feature uses the existing `DATABASE_URL` and `SUPABASE_URL`.
 Run its PostgreSQL integration check explicitly against the development database
@@ -122,7 +125,7 @@ HTTP 200 (example contents):
 
 Student executions are stored in `submissions`. The lab fetch contract still
 omits `solved` and `last_code`. The frontend can initialize the editor with
-`starter`. Lab detail also includes the backend's `integrity_policy`, documented
+`starter`. Lab detail also includes `max_submissions`, `allow_resubmissions`, and the backend's `integrity_policy`, documented
 in `docs/frontend-integrity.md`.
 Hidden tests and reference solutions are never returned.
 
@@ -233,6 +236,65 @@ execution finished. Retrying Run performs a new execution and saves a new
 submission. The runner's Docker isolation and internal-key enforcement must be
 verified against its deployment separately.
 
+## Final submissions
+
+Labs support configurable maximum accepted submissions: 1, 2, 3, or another
+positive integer; NULL means unlimited. The first accepted final counts toward
+the limit. Failed executions and practice runs do not consume it.
+
+Apply `db/migrations/20261127_002_final_submissions.sql` after the integrity
+migration, then `db/migrations/20261127_003_submission_limits.sql`. Existing
+stored runs receive `kind=practice`. Existing false policies become a limit of
+1; existing true policies remain unlimited. Upload `max_submissions` as a
+positive integer text field or `unlimited`.
+
+- `PATCH /api/labs/{id}` lets the course owner change the limit with JSON
+  `{"max_submissions":3}` (or null for unlimited). Lowering a limit preserves
+  accepted versions and floors remaining allowance at zero.
+
+- `POST /api/labs/{id}/submit` freshly verifies student code. It requires a UUID
+  `Idempotency-Key` header and JSON `{code}`. HTTP 200 returns
+  `{accepted,submission_id,submitted_at,execution}`.
+- `GET /api/labs/{id}/submission` returns the student's current accepted status,
+  policy, accepted count, remaining allowance, version, and SHA-256 digest.
+- `GET /api/courses/{courseId}/students/{studentId}/report` gives the course owner
+  per-lab practice counts, latest accepted finals, and current integrity.
+- `GET /api/submissions/{submissionId}` lets the course owner inspect an accepted
+  version's exact source and sanitized execution results.
+
+A final requires `status=ok`, `total>0`, and `passed=total`. Failed executions
+return `accepted=false` without consuming the allowance. Accepted versions are
+preserved and the highest version is current. The backend and database enforce
+the accepted-submission limit, including concurrent requests.
+Practice runs remain unlimited. Teacher preview runs create no student record.
+
+Idempotent replay precedes the submission-lock check. A repeated key/source
+returns its original committed outcome. Different source under that key produces
+`409 IDEMPOTENCY_KEY_REUSED`. Concurrent operations for one student/lab produce
+`409 SUBMISSION_PROCESSING` with `Retry-After: 2`. A new action on a locked lab
+returns `409 FINAL_SUBMISSION_LOCKED` for a limit of 1, or
+`409 SUBMISSION_LIMIT_REACHED` for a larger exhausted limit. Committed rejections
+still replay after a policy increase; a new action needs a new key.
+
+Accepted rows and outcomes commit atomically. Uncommitted execution may repeat
+after a crash or save failure. A committed outcome replays after response loss.
+The existing report categorizes records as `practice` or `final`, preserves
+timelines, and labels integrity as `current_lab`. No submission-time integrity
+snapshot is recorded.
+
+The [frontend final-submission guide](docs/frontend-final-submissions.md)
+contains exact types, submission-limit controls, pending-action persistence,
+retry logic, digest comparison, error codes, and curl examples.
+No new environment variables are required.
+
+Run the final-submission PostgreSQL tests explicitly. They create an isolated
+temporary schema and remove it afterward. They use real SQL, transactions,
+constraints, and concurrency with mocked authentication and runner HTTP.
+
+```bash
+node --env-file=.env.local --test tests/integration/final-submissions.test.mjs
+```
+
 ## Integrity events and reports
 
 Apply `db/migrations/20261127_001_integrity.sql` once after the course migration.
@@ -314,6 +376,7 @@ curl -i http://localhost:3000/api/labs \
   -H "Authorization: Bearer $TOKEN" \
   -F "course_id=$COURSE_ID" \
   -F 'title=Sum Positive Numbers' \
+  -F 'max_submissions=1' \
   -F 'instructions=@demo-lab-unittest/instructions.md' \
   -F 'starter=@demo-lab-unittest/starter.py' \
   -F 'tests=@demo-lab-unittest/tests.py' \
@@ -346,8 +409,9 @@ size, and required form fields; it does not execute tests or call `/validate`.
 Retrying identical code will not repair an incompatible test file.
 
 Fixing a local file does not change an already-uploaded lab. Upload the corrected
-four files as a **new lab** and open the new ID. There is currently no lab-update
-endpoint. Existing database labs are not modified by these demo changes.
+four files as a **new lab** and open the new ID. The lab PATCH endpoint updates
+the submission limit only; it does not replace uploaded files. Existing database
+labs are not modified by these demo changes.
 
 ## Getting Started
 

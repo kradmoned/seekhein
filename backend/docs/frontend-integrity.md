@@ -5,6 +5,12 @@ The backend implements event validation, access control, storage, penalties,
 submission recording, and reports. The frontend implements immediate editor
 restrictions, activity collection, reliable delivery, and report rendering.
 
+Final submission and practice execution have separate workflows. Follow
+[frontend-final-submissions.md](frontend-final-submissions.md) for the required
+submission-limit control, Submit action, retry recovery, accepted-code digest,
+and teacher code inspection. Lab details return `max_submissions` and the
+compatibility field `allow_resubmissions`.
+
 ## Backend contract
 
 Use the existing authenticated API client. All requests carry
@@ -292,6 +298,8 @@ The response shape is
 type LabReport = {
   lab_id: string
   title: string
+  allow_resubmissions: boolean
+  max_submissions: number | null
   integrity_policy: Record<string, unknown>
   chat_available: false
   students: Array<{
@@ -300,6 +308,8 @@ type LabReport = {
     full_name: string | null
     enrolled: boolean
     first_pass_at: string | null
+    accepted_submission_count: number
+    remaining_submissions: number | null
     events: Array<{
       event_id: string
       session_id: string
@@ -310,6 +320,10 @@ type LabReport = {
     }>
     submissions: Array<{
       id: string
+      kind: "practice" | "final"
+      version: number | null
+      code_sha256: string | null
+      results: Array<{ name: string; passed: boolean; error: string | null }>
       status: string
       score: number
       passed: number
@@ -340,6 +354,11 @@ or missing the opening event. A score of 100 with missing telemetry should
 not be presented as evidence of observed clean activity. Display event text
 using React text nodes. The report contains no clipboard contents or hidden
 test source. `chat_available` remains false until tutor chat storage exists.
+
+Each student also receives `practice_attempt_count`, `accepted_submission`, and
+`integrity_scope: "current_lab"`. The accepted-submission shape is specified in
+the final-submission guide. Filter attempts using `kind` when presenting practice
+counts or final versions. Integrity remains current across both attempt kinds.
 
 Overlapping `window_blur` and `tab_hidden` events count as a single departure
 until both visibility and focus return. Each page session tracks its own state.

@@ -1,7 +1,8 @@
 import { requireUser } from "../../../lib/auth"
 import { pool } from "../../../lib/db"
 import { courseAccessSql, requireCourse } from "../../../lib/courses"
-import { errorResponse, uuidPattern } from "../../../lib/http"
+import { errorResponse, HttpError, uuidPattern } from "../../../lib/http"
+import { allowsResubmissions, readUploadSubmissionLimit } from "../../../lib/submission-policy"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -84,6 +85,14 @@ export async function POST(req: Request) {
     validationErrors.push("A lab title is required.")
   }
 
+  let maxSubmissions: number | null = 1
+  try {
+    maxSubmissions = readUploadSubmissionLimit(form)
+  } catch (error) {
+    if (!(error instanceof HttpError)) throw error
+    validationErrors.push(error.message)
+  }
+
   const files: Record<FileField, string> = {
     instructions: "",
     starter: "",
@@ -140,9 +149,11 @@ export async function POST(req: Request) {
          starter,
          tests,
          solution,
-         course_id
+         course_id,
+         allow_resubmissions,
+         max_submissions
        )
-       SELECT $1, $2, $3, $4, $5, $6, c.id
+       SELECT $1, $2, $3, $4, $5, $6, c.id, $8, $9
        FROM public.courses c WHERE c.id = $7 AND c.teacher_id = $1
        RETURNING id`,
       [
@@ -153,6 +164,8 @@ export async function POST(req: Request) {
         files.tests,
         files.solution,
         courseId,
+        allowsResubmissions(maxSubmissions),
+        maxSubmissions,
       ],
     )
 
