@@ -839,3 +839,215 @@ test('switching ordinary submission to submit anyway uses a new key for the same
   expect(requests.map(request => request.submit_anyway)).toEqual([false, true])
   expect(requests[0].code).toBe(requests[1].code)
 })
+
+const chatId = '55555555-5555-4555-8555-555555555555'
+const turnId = '66666666-6666-4666-8666-666666666666'
+const assistantId = '77777777-7777-4777-8777-777777777777'
+const chatConversation = { protocol_version: 2, lifecycle: 'active', conversation_id: chatId, lab_id: labId, created_at: '2026-11-28T12:00:00Z', updated_at: '2026-11-28T12:00:00Z' }
+async function chatSetup(page: Page, failFirst = false) {
+  const requests: Array<{ key: string; body: { message: string; current_code: string; attempt_id: string | null } }> = []
+  let completed = false
+  let creations = 0
+  await page.route(`**/api/labs/${labId}/conversations?*`, route => route.fulfill({ json: { conversations: [chatConversation], next_after: null } }))
+  await page.route(`**/api/labs/${labId}/conversations`, route => { creations++; return route.fulfill({ status: 201, json: chatConversation }) })
+  await page.route(`**/api/conversations/${chatId}/messages?*`, route => route.fulfill({ json: { conversation_id: chatId, protocol_version: 2, can_send: true, blocking_turn_id: null, next_after: null, turns: completed ? [{ turn_id: turnId, sequence: 1, idempotency_key: requests[0].key, attempt_id: requests[0].body.attempt_id, status: 'completed', error_code: null, created_at: chatConversation.created_at, completed_at: chatConversation.created_at, messages: [{ id: turnId, role: 'user', content: requests[0].body.message, sources: [], created_at: chatConversation.created_at }, { id: assistantId, role: 'assistant', content: 'Consider where your loop returns. <script>unsafe()</script>', sources: [], created_at: chatConversation.created_at }] }] : [] } }))
+  await page.route(`**/api/conversations/${chatId}/messages`, route => {
+    requests.push({ key: route.request().headers()['idempotency-key'], body: route.request().postDataJSON() })
+    completed = true
+    if (failFirst && requests.length === 1) return route.abort('failed')
+    return route.fulfill({ json: { conversation_id: chatId, turn_id: turnId, student_message_id: turnId, assistant_message_id: assistantId, answer: 'Consider where your loop returns. <script>unsafe()</script>', sources: [] } })
+  })
+  return { requests, creations: () => creations }
+}
+
+test('assistant captures displayed run context and preserves editor while resizing and closing', async ({ page }) => {
+  await setup(page)
+  const chat = await chatSetup(page)
+  await page.route(`**/api/labs/${labId}/run`, route => route.fulfill({ json: { ...execution, attempt_id: submissionId } }))
+  await openLab(page)
+  await page.getByRole('button', { name: 'Run code', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Run code', exact: true })).toBeEnabled()
+  await insert(page, '# edit\n')
+  const original = await editorCode(page)
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await expect(page.getByText('Your editor has changed since that execution.', { exact: false })).toBeVisible()
+  await page.getByLabel('Question for assistant').fill('Why does it return?')
+  await page.getByRole('button', { name: 'Send question', exact: true }).click()
+  await expect(page.getByText('Consider where your loop returns. <script>unsafe()</script>', { exact: true })).toBeVisible()
+  expect(chat.requests[0].body).toEqual({ message: 'Why does it return?', current_code: original, attempt_id: submissionId })
+  const separator = page.getByRole('separator', { name: 'Resize workspace and assistant', exact: true })
+  await separator.focus(); await separator.press('ArrowLeft')
+  await page.getByRole('button', { name: 'Close assistant', exact: true }).click()
+  expect(await editorCode(page)).toBe(original)
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await expect(page.getByText('Consider where your loop returns. <script>unsafe()</script>', { exact: true })).toBeVisible()
+  expect(chat.creations()).toBe(0)
+})
+
+test('assistant replays original pending question and context after reload even when history is completed', async ({ page }) => {
+  await setup(page)
+  const chat = await chatSetup(page, true)
+  await openLab(page)
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await page.getByLabel('Question for assistant').fill('Explain my code')
+  await page.getByRole('button', { name: 'Send question', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Recover question', exact: true })).toBeEnabled()
+  await page.reload()
+  await expect(page.getByRole('button', { name: 'Run code', exact: true })).toBeEnabled()
+  await insert(page, '# changed\n')
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await page.getByRole('button', { name: 'Recover question', exact: true }).click()
+  await expect.poll(() => chat.requests.length).toBe(2)
+  expect(chat.requests[1]).toEqual(chat.requests[0])
+  expect(chat.requests[1].body.current_code).toBe('x = 1')
+  await expect(page.getByRole('button', { name: 'Recover question', exact: true })).toHaveCount(0)
+  expect(chat.creations()).toBe(0)
+})
+
+test('assistant blocks sending if recovery storage is full and supports mobile workspace switching', async ({ page }) => {
+  await setup(page); const chat = await chatSetup(page)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await openLab(page)
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await expect(page.getByRole('region', { name: 'Lab assistant', exact: true })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Python editor', exact: true })).toBeHidden()
+  await page.evaluate(() => { const original = Storage.prototype.setItem; Storage.prototype.setItem = function(key, value) { if (key.startsWith('lab-chat:')) throw new DOMException('Quota exceeded', 'QuotaExceededError'); return original.call(this, key, value) } })
+  await page.getByLabel('Question for assistant').fill('Help')
+  await page.getByRole('button', { name: 'Send question', exact: true }).click()
+  await expect(page.getByText('Recovery storage unavailable', { exact: true })).toBeVisible()
+  expect(chat.requests).toHaveLength(0)
+  await page.getByRole('button', { name: 'Close assistant', exact: true }).click()
+  await expect(page.getByRole('region', { name: 'Python editor', exact: true })).toBeVisible()
+})
+
+test('assistant paginates whole turns and honors Retry-After without changing the request', async ({ page }) => {
+  await setup(page)
+  await chatSetup(page)
+  const historyPages: string[] = []
+  await page.route(`**/api/conversations/${chatId}/messages?*`, route => {
+    const after = new URL(route.request().url()).searchParams.get('after')
+    historyPages.push(after!)
+    const second = after === '1'
+    return route.fulfill({ json: { conversation_id: chatId, protocol_version: 2, can_send: true, blocking_turn_id: null, next_after: second ? null : 1, turns: [{ turn_id: second ? assistantId : turnId, sequence: second ? 2 : 1, idempotency_key: second ? assistantId : turnId, attempt_id: null, status: 'completed', error_code: null, created_at: chatConversation.created_at, completed_at: chatConversation.created_at, messages: [{ id: second ? assistantId : turnId, role: 'assistant', content: second ? 'Second page answer' : 'First page answer', sources: [], created_at: chatConversation.created_at }] }] } })
+  })
+  const requests: Array<{ key: string; body: unknown }> = []
+  await page.route(`**/api/conversations/${chatId}/messages`, route => {
+    requests.push({ key: route.request().headers()['idempotency-key'], body: route.request().postDataJSON() })
+    return route.fulfill({ status: 409, headers: { 'Retry-After': '2' }, json: { code: 'TURN_PROCESSING', error: 'Another question is processing.' } })
+  })
+  await openLab(page)
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await expect(page.getByText('First page answer', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Load more messages', exact: true }).click()
+  await expect(page.getByText('Second page answer', { exact: true })).toBeVisible()
+  expect(historyPages).toContain('1')
+  await page.getByLabel('Question for assistant').fill('Explain this')
+  await page.getByRole('button', { name: 'Send question', exact: true }).click()
+  await expect(page.getByRole('button', { name: /Retry in/ })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Recover question', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: 'Recover question', exact: true }).click()
+  await expect.poll(() => requests.length).toBe(2)
+  expect(requests[1]).toEqual(requests[0])
+})
+
+test('assistant lists conversations after uncertain creation instead of automatically creating duplicates', async ({ page }) => {
+  await setup(page)
+  let created = false, creates = 0
+  await page.route(`**/api/labs/${labId}/conversations?*`, route => route.fulfill({ json: { conversations: created ? [chatConversation] : [], next_after: null } }))
+  await page.route(`**/api/labs/${labId}/conversations`, route => { creates++; created = true; return route.abort('failed') })
+  await page.route(`**/api/conversations/${chatId}/messages?*`, route => route.fulfill({ json: { conversation_id: chatId, protocol_version: 2, can_send: true, blocking_turn_id: null, turns: [], next_after: null } }))
+  await openLab(page)
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await page.getByRole('button', { name: 'New chat', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'New chat', exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: 'Refresh conversations', exact: true }).click()
+  await expect(page.getByLabel('Conversation', { exact: true })).toHaveValue(chatId)
+  expect(creates).toBe(1)
+  await expect(page.getByLabel('Question for assistant')).toBeVisible()
+})
+
+test('stateful assistant recovers a blocking turn outside the history page without browser storage', async ({ page }) => {
+  await setup(page); await chatSetup(page)
+  let recovered = false
+  const recoverRequests: Array<{ body: string | null; key?: string }> = []
+  const makeTurn = (late: boolean) => ({ turn_id: late ? assistantId : turnId, sequence: late ? 21 : 1, idempotency_key: late ? assistantId : turnId, attempt_id: null, status: late && !recovered ? 'recovery_required' : 'completed', error_code: late && !recovered ? 'TUTOR_TIMEOUT' : null, created_at: chatConversation.created_at, completed_at: recovered || !late ? chatConversation.created_at : null, messages: [{ id: late ? assistantId : turnId, role: late && !recovered ? 'user' : 'assistant', content: late ? recovered ? 'Recovered original answer' : 'Original question' : 'Earlier exchange', sources: [], created_at: chatConversation.created_at }] })
+  await page.route(`**/api/conversations/${chatId}/messages?*`, route => {
+    const late = new URL(route.request().url()).searchParams.get('after') === '1'
+    return route.fulfill({ json: { conversation_id: chatId, protocol_version: 2, can_send: recovered, blocking_turn_id: recovered ? null : assistantId, turns: [makeTurn(late)], next_after: late ? null : 1 } })
+  })
+  await page.route(`**/api/conversations/${chatId}/turns/${assistantId}/recover`, route => {
+    recoverRequests.push({ body: route.request().postData(), key: route.request().headers()['idempotency-key'] })
+    recovered = true
+    return route.fulfill({ json: { conversation_id: chatId, turn_id: assistantId, student_message_id: turnId, assistant_message_id: assistantId, answer: 'Recovered original answer', sources: [] } })
+  })
+  await openLab(page); await insert(page, '# changed editor\n')
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await page.getByLabel('Question for assistant').fill('Another question')
+  await expect(page.getByRole('button', { name: 'Send question', exact: true })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Delete chat', exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: 'Recover previous answer', exact: true }).click()
+  await expect(page.getByText('Recovered original answer', { exact: true })).toBeVisible()
+  expect(recoverRequests).toEqual([{ body: null, key: undefined }])
+  await expect(page.getByRole('button', { name: 'Send question', exact: true })).toBeEnabled()
+})
+
+test('stateful assistant permits a new action after definite failure and gives operator guidance for oversized context', async ({ page }) => {
+  await setup(page); await chatSetup(page)
+  const requests: Array<{ key: string; body: { message: string } }> = []
+  await page.route(`**/api/conversations/${chatId}/messages`, route => {
+    requests.push({ key: route.request().headers()['idempotency-key'], body: route.request().postDataJSON() })
+    return route.fulfill({ status: 413, json: { error: 'Context exceeds the limit.', code: 'TUTOR_CONTEXT_TOO_LARGE' } })
+  })
+  await page.route(`**/api/conversations/${chatId}/messages?*`, route => route.fulfill({ json: { conversation_id: chatId, protocol_version: 2, can_send: true, blocking_turn_id: null, next_after: null, turns: requests.map((r, i) => ({ turn_id: i ? assistantId : turnId, sequence: i + 1, idempotency_key: r.key, attempt_id: null, status: 'failed', error_code: 'TUTOR_CONTEXT_TOO_LARGE', created_at: chatConversation.created_at, completed_at: chatConversation.created_at, messages: [{ id: i ? assistantId : turnId, role: 'user', content: r.body.message, sources: [], created_at: chatConversation.created_at }] })) } }))
+  await openLab(page); await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await page.getByLabel('Question for assistant').fill('First question')
+  await page.getByRole('button', { name: 'Send question', exact: true }).click()
+  await expect(page.getByText(/Ask the course administrator to review the integration/)).toBeVisible()
+  await page.getByLabel('Question for assistant').fill('New question')
+  await expect(page.getByRole('button', { name: 'Send question', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: 'Send question', exact: true }).click()
+  await expect.poll(() => requests.length).toBe(2)
+  expect(requests[0].key).not.toBe(requests[1].key)
+  expect(requests[1].body.message).toBe('New question')
+})
+
+test('stateful assistant keeps version one conversations readable without sending or replaying old questions', async ({ page }) => {
+  await setup(page); const chat = await chatSetup(page)
+  await page.route(`**/api/labs/${labId}/conversations?*`, route => route.fulfill({ json: { conversations: [{ ...chatConversation, protocol_version: 1 }], next_after: null } }))
+  await page.route(`**/api/conversations/${chatId}/messages?*`, route => route.fulfill({ json: { conversation_id: chatId, protocol_version: 1, can_send: false, blocking_turn_id: null, next_after: null, turns: [{ turn_id: turnId, sequence: 1, idempotency_key: turnId, attempt_id: null, status: 'completed', error_code: null, created_at: chatConversation.created_at, completed_at: chatConversation.created_at, messages: [{ id: turnId, role: 'assistant', content: 'Historical answer', sources: [], created_at: chatConversation.created_at }] }] } }))
+  await openLab(page); await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await expect(page.getByText('Historical answer', { exact: true })).toBeVisible()
+  await expect(page.getByText('Read-only conversation', { exact: true })).toBeVisible()
+  await page.getByLabel('Question for assistant').fill('New question')
+  await expect(page.getByRole('button', { name: 'Send question', exact: true })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Start new chat', exact: true })).toBeVisible()
+  expect(chat.requests).toHaveLength(0)
+})
+
+test('stateful reset retries deletion after reload and creates a fresh conversation only after cleanup succeeds', async ({ page }) => {
+  await setup(page)
+  let deleting = false, deleted = false
+  const actions: string[] = []
+  const newId = '88888888-8888-4888-8888-888888888888'
+  await page.route(`**/api/labs/${labId}/conversations?*`, route => route.fulfill({ json: { conversations: deleted ? [] : [{ ...chatConversation, lifecycle: deleting ? 'deleting' : 'active' }], next_after: null } }))
+  await page.route(`**/api/labs/${labId}/conversations`, route => { actions.push('create'); expect(deleted).toBe(true); return route.fulfill({ status: 201, json: { ...chatConversation, conversation_id: newId } }) })
+  await page.route('**/api/conversations/*/messages?*', route => { const id = new URL(route.request().url()).pathname.split('/')[3]; return route.fulfill({ json: { conversation_id: id, protocol_version: 2, can_send: id === newId || !deleting, blocking_turn_id: null, turns: [], next_after: null } }) })
+  await page.route(`**/api/conversations/${chatId}`, route => {
+    expect(route.request().method()).toBe('DELETE'); expect(route.request().postData()).toBeNull()
+    actions.push('delete'); deleting = true
+    if (actions.length === 1) return route.fulfill({ status: 503, json: { error: 'Cleanup unavailable', code: 'TUTOR_UNAVAILABLE' } })
+    deleted = true; return route.fulfill({ json: { conversation_id: chatId, deleted: true } })
+  })
+  await openLab(page); await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await page.getByRole('button', { name: 'Reset chat', exact: true }).click()
+  await page.getByRole('button', { name: 'Confirm reset', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Retry delete', exact: true })).toBeEnabled()
+  expect(actions).toEqual(['delete'])
+  await page.reload(); await expect(page.getByRole('button', { name: 'Run code', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: 'Ask assistant', exact: true }).click()
+  await page.getByLabel('Question for assistant').fill('Do not send')
+  await expect(page.getByRole('button', { name: 'Send question', exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: 'Retry delete', exact: true }).click()
+  await expect(page.getByLabel('Conversation', { exact: true })).toHaveValue(newId)
+  expect(actions).toEqual(['delete', 'delete', 'create'])
+})

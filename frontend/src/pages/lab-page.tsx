@@ -1,3 +1,5 @@
+import { LabAssistant } from '@/components/lab-assistant'
+import { isUuid } from '@/lib/chat'
 import { TeacherLabOverview } from '@/pages/teacher-lab-overview'
 import { ExecutionOutput } from "@/components/execution-output"
 import { Notice } from "@/components/ui/notice"
@@ -50,6 +52,9 @@ function LabWorkspace({ id, userId, labPath }: { id: string; userId: string; lab
   const wrapper = useRef<HTMLDivElement>(null);
   const guard = useRef<ReturnType<typeof installIntegrityGuard> | null>(null);
   const telemetry = useRef<ReturnType<typeof createTelemetry> | null>(null);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantStarted, setAssistantStarted] = useState(false);
+  const [attemptId, setAttemptId] = useState<string | null>(null);
   const [editorReady, setEditorReady] = useState(false);
   const [submissionDetailsOpen, setSubmissionDetailsOpen] = useState(false);
   const { notify, dismiss } = useNotifications();
@@ -120,8 +125,8 @@ function LabWorkspace({ id, userId, labPath }: { id: string; userId: string; lab
     updateCode(guard.current.getAcceptedCode());
     setEditorReady(true);
   };
-  function showFinalResult(value: RunResult, snapshot: string) {
-    setResult(value); setSubmittedCode(snapshot); setServiceError('');
+  function showFinalResult(value: RunResult, snapshot: string, savedAttempt: string | null = null) {
+    setResult(value); setAttemptId(savedAttempt); setSubmittedCode(snapshot); setServiceError('');
   }
   async function runCode() {
     if (runController.current || !guard.current || submission.busy) return;
@@ -134,19 +139,22 @@ function LabWorkspace({ id, userId, labPath }: { id: string; userId: string; lab
     const controller = new AbortController();
     runController.current = controller;
     setRunning(true);
-    setResult(null);
+    setResult(null); setAttemptId(null);
     setSubmittedCode(snapshot);
 
     try {
       if (student) { telemetry.current?.emit('run'); await telemetry.current?.flush(); }
       if (controller.signal.aborted) return;
-      const response = execution(await api<unknown>(`/api/labs/${encodeURIComponent(id)}/run`, {
+      const raw = await api<unknown>(`/api/labs/${encodeURIComponent(id)}/run`, {
         signal: controller.signal,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
-      }));
-      if (!controller.signal.aborted) setResult(response);
+      });
+      const response = execution(raw);
+      const savedAttempt = (raw as { attempt_id?: unknown }).attempt_id;
+      if (savedAttempt !== undefined && savedAttempt !== null && !isUuid(savedAttempt)) throw Error('Invalid execution reference from server.');
+      if (!controller.signal.aborted) { setResult(response); setAttemptId(isUuid(savedAttempt) ? savedAttempt : null); }
     } catch (error) {
       if (controller.signal.aborted) return;
       setServiceError(
@@ -175,7 +183,7 @@ function LabWorkspace({ id, userId, labPath }: { id: string; userId: string; lab
     );
 
   const output = (
-    <ExecutionOutput result={result} busy={running || submission.busy || !!serviceError} stale={code !== submittedCode} onClear={() => setResult(null)}>
+    <ExecutionOutput result={result} busy={running || submission.busy || !!serviceError} stale={code !== submittedCode} onClear={() => { setResult(null); setAttemptId(null); }}>
         {student && submission.message && <Notice tone={submission.messageTone} title={submission.messageTitle}
           actions={!submission.busy && (submission.pending.length > 0 || submission.statusError || submission.storageError) ? <Button size="sm" variant="outline" onClick={() => setSubmissionDetailsOpen(true)}>Review submission</Button> : undefined}>{submission.message}</Notice>}
         {student && !submission.message && !submission.busy && (submission.statusError || submission.storageError || submission.pending.length > 0) &&
@@ -237,7 +245,7 @@ function LabWorkspace({ id, userId, labPath }: { id: string; userId: string; lab
     </section>
   );
 
-  return (
+  const workspace = (
     <section className="flex min-h-full flex-col gap-1 p-1 lg:h-full lg:min-h-0 lg:overflow-hidden">
       {!student && <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 rounded-lg border bg-card px-4 py-3"><div><p className="font-medium">Teacher preview</p><p className="text-xs text-muted-foreground">Test the lab without submitting a student attempt. Changes here do not edit the published starter code.</p></div><Link className="text-sm font-medium underline" to={labPath}>Back to lab management</Link></header>}
       {telemetryWarning && <Notice tone="warning" title="Activity sync needs attention" className="shrink-0">{telemetryWarning}</Notice>}
@@ -251,4 +259,11 @@ function LabWorkspace({ id, userId, labPath }: { id: string; userId: string; lab
       />
     </section>
   );
+  return <div className="flex min-h-full flex-col lg:h-full lg:min-h-0">
+    {student && !assistantOpen && <Button size="sm" className="fixed right-4 bottom-[max(1rem,env(safe-area-inset-bottom))] z-30 rounded-full border border-primary/20 px-4 shadow-md" aria-expanded={false} onClick={() => { setAssistantStarted(true); setAssistantOpen(true) }}>Ask assistant</Button>}
+    <ResizableSplit className="flex-1 lg:min-h-0" desktopOnly defaultSize={70} minFirst={560} minSecond={300} label="Resize workspace and assistant" storageKey="lab-assistant-width" secondOpen={student && assistantOpen} secondOnMobile={student && assistantOpen}
+      first={workspace} second={student && assistantStarted ? <LabAssistant userId={userId} labId={id} getCode={() => guard.current!.getAcceptedCode()} attemptId={attemptId} editorReady={editorReady && !running && !submission.busy}
+        contextLabel={attemptId ? `Using the saved execution shown in the console.${code !== submittedCode ? ' Your editor has changed since that execution.' : ''}` : result ? 'This console result has no saved attempt. The assistant will use the latest saved execution, if any; run this code to attach its result.' : 'Using your latest saved execution, if any.'}
+        onClose={() => setAssistantOpen(false)} /> : null} />
+  </div>;
 }

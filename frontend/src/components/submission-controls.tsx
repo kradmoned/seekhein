@@ -11,7 +11,7 @@ import type { RunResult } from '@/lib/types'
 
 type Props = {
   submission: ReturnType<typeof useSubmissions>; code: string; editorReady: boolean; runBusy: boolean;
-  getCode: () => string; flush: () => Promise<void>; onResult: (result: RunResult, code: string) => void;
+  getCode: () => string; flush: () => Promise<void>; onResult: (result: RunResult, code: string, attemptId?: string | null) => void;
   offerSubmitAnyway?: boolean; open: boolean; onOpenChange: (open: boolean) => void;
 }
 export function SubmissionControls({ submission: s, code, editorReady, runBusy, getCode, flush, onResult, open, onOpenChange, offerSubmitAnyway }: Props) {

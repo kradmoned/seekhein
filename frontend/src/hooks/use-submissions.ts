@@ -49,7 +49,7 @@ export function useSubmissions(userId: string, labId: string, enabled: boolean) 
     return () => { active.current = false; statusController.current?.abort(); sendController.current?.abort(); window.removeEventListener('storage', storage) }
   }, [enabled, refresh, readPending, userId, labId])
 
-  async function send(saved: PendingSubmission, onResult: (execution: RunResult, code: string) => void) {
+  async function send(saved: PendingSubmission, onResult: (execution: RunResult, code: string, attemptId?: string | null) => void) {
     const controller = new AbortController(); sendController.current = controller
     try {
       let value: unknown
@@ -69,7 +69,7 @@ export function useSubmissions(userId: string, labId: string, enabled: boolean) 
       }
       const result = submitResult(value)
       if (!active.current || controller.signal.aborted) return
-      onResult(result.execution, saved.code)
+      onResult(result.execution, saved.code, result.submission_id)
       setMessage(result.accepted ? 'This version is saved and uses one submission slot.' : 'This attempt was not saved and used no submission slot. Fix your code or use Submit anyway to hand in unfinished work.', result.accepted ? 'success' : 'warning', result.accepted ? result.submission_status === 'pending_review' ? 'Submitted — pending teacher review' : 'Submitted — tests passed' : 'Check your test results')
       try { resolveSubmission(userId, labId, saved.key); readPending() }
       catch { setStorageError('The outcome is known, but its recovery record could not be removed. Replaying it is safe.') }
@@ -85,7 +85,7 @@ export function useSubmissions(userId: string, labId: string, enabled: boolean) 
       }
     } finally { lock.current = false; if (active.current) setBusy(false) }
   }
-  async function submit(code: string, flush: () => Promise<void>, onResult: (execution: RunResult, code: string) => void, submitAnyway = false) {
+  async function submit(code: string, flush: () => Promise<void>, onResult: (execution: RunResult, code: string, attemptId?: string | null) => void, submitAnyway = false) {
     if (!enabled || lock.current || loading || statusError || storageError || pending.length > 0 || !status?.can_submit) return
     const invalid = validateCode(code)
     if (invalid) { setMessage(invalid, 'warning', 'Check your code'); return }
@@ -97,7 +97,7 @@ export function useSubmissions(userId: string, labId: string, enabled: boolean) 
     if (!active.current) { lock.current = false; return }
     await send(saved, onResult)
   }
-  function recover(saved: PendingSubmission, onResult: (execution: RunResult, code: string) => void) {
+  function recover(saved: PendingSubmission, onResult: (execution: RunResult, code: string, attemptId?: string | null) => void) {
     if (!enabled || lock.current) return
     lock.current = true; setBusy(true); setMessage('Recovering the original saved code…')
     void send(saved, onResult)
