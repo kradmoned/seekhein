@@ -40,6 +40,7 @@ def build_context(
     executed_code: str | None = None,
     output_error: dict | None = None,
     validation_feedback: dict | None = None,
+    lab_context: dict | None = None,
     db_path: str | None = None,
 ) -> dict:
 
@@ -70,6 +71,7 @@ def build_context(
     return {
         "message": message,
         "scenario": scenario,
+        "lab_context": lab_context,
         "current_code": current_code,
         "executed_code": executed_code,
         "execution_feedback": safe_execution_feedback,

@@ -1,185 +1,176 @@
-# Seekhein Socratic Lab Assistant --- Backend Integration Guide
+# Seekhein Socratic Lab Assistant — Backend Integration Guide
 
-**API:** `POST /api/v1/tutor`\
-**Health check:** `GET /health`\
-**Request format:** JSON\
-**Current implementation:** FastAPI
+**Primary endpoint:** `POST /api/v1/tutor`  
+**Session cleanup:** `DELETE /api/v1/sessions/{conversation_id}`  
+**Health check:** `GET /health`  
+**Request format:** JSON  
+**Implementation:** FastAPI (`ai-server/api/main.py`)
 
-This document describes how the backend should call the Seekhein
-Socratic Lab Assistant API.
+This document is the API contract between the Seekhein backend and the `ai-server` Socratic Lab Assistant.
 
-------------------------------------------------------------------------
+---
 
-## 1. Run the API locally
+## 1. Endpoints & Authentication
 
-From the Seekhein project root:
+| Method | Path | Purpose | Auth (when deployed behind Caddy) |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/health` | Health check | Public (no token required) |
+| `GET` | `/docs` | Interactive Swagger UI | `Authorization: Bearer <TUTOR_API_TOKEN>` |
+| `POST` | `/api/v1/tutor` | Send a student turn and receive Socratic guidance | `Authorization: Bearer <TUTOR_API_TOKEN>` |
+| `DELETE` | `/api/v1/sessions/{conversation_id}` | Delete a stored session, its history, and its pinned `lab_context` | `Authorization: Bearer <TUTOR_API_TOKEN>` |
 
-``` powershell
+> **Note:** `ai-server` itself does not validate bearer tokens; when deployed with `scripts/deploy-ec2.sh`, Caddy enforces `Authorization: Bearer <TUTOR_API_TOKEN>` on every path except `/health`. In local development (`http://127.0.0.1:8000`), no `Authorization` header is needed.
+
+### Local Run & Health Check
+
+From `ai-server/`:
+
+```bash
 uv run uvicorn api.main:app --reload
 ```
 
-The local API base URL is:
-
-``` text
-http://127.0.0.1:8000
-```
-
-Useful endpoints:
-
--   Health check: `GET http://127.0.0.1:8000/health`
--   Interactive API documentation: `http://127.0.0.1:8000/docs`
--   Tutor endpoint: `POST http://127.0.0.1:8000/api/v1/tutor`
-
-The local URL is only reachable from the same machine. For integration
-between separately hosted services, use the deployed/reachable API base
-URL configured for the environment; do not hard-code `127.0.0.1` in a
-remotely hosted backend.
-
-### Health-check example
-
-``` http
+```http
 GET /health
 ```
 
 Expected response:
 
-``` json
+```json
 {
   "status": "ok",
   "message": "Seekhein API is running"
 }
 ```
 
-------------------------------------------------------------------------
+Do not hard-code `127.0.0.1` in a remotely hosted backend; configure `TUTOR_API_URL` (and optional `TUTOR_API_TOKEN`) per environment.
 
-## 2. Tutor endpoint
+---
 
-``` http
+## 2. Server-Side State Model
+
+`ai-server` manages conversation context in a local SQLite database (`SESSION_DB_PATH`, defaulting to `./data/sessions.db`, or `/opt/ai-server/data/sessions.db` on EC2):
+
+1. **Pinned `lab_context`:** When the backend sends `lab_context` (typically on turn 1), `ai-server` stores it on the `sessions` row for `conversation_id` and injects it as a dedicated `system` message **before** the conversation history on every turn — so it is never evicted as the chat grows.
+2. **Sliding history window:** Every completed turn is persisted in SQLite (`messages` table). On each request, `ai-server` loads the most recent `MAX_HISTORY_TURNS` turns (default `6` turns = `12` messages) in chronological order and sends them to OpenRouter.
+3. **Turn-level idempotency:** Completed turns with an `idempotency_key` are recorded in the `turns` table so backend retries safely return the saved response without calling OpenRouter again or duplicating history.
+
+---
+
+## 3. Tutor Endpoint (`POST /api/v1/tutor`)
+
+```http
 POST /api/v1/tutor
 Content-Type: application/json
+Idempotency-Key: <unique-turn-uuid>
+Authorization: Bearer <TUTOR_API_TOKEN>
 ```
 
-The backend should send one request for each student message/turn. The
-API does not rely on server-side conversation history: send the recent
-conversation messages with each request.
+### Request Fields
 
-### Request body
+| Field | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `conversation_id` | `string` | **Yes** | Conversation identifier (`1–128` non-whitespace chars). Used as the SQLite session key and echoed in the response. |
+| `message` | `string` | **Yes** | Student's current message. Must not be empty or whitespace-only. |
+| `idempotency_key` | `string \| null` | No | Per-turn deduplication key (`1–128` non-whitespace chars). Also accepted via the `Idempotency-Key` HTTP header (`idempotency_key` in the JSON body takes precedence if both are sent). |
+| `lab_context` | `object \| null` | No | Lab metadata pinned to the session (`title`, `instructions`, `starter_code`/`starter`, `tests`, `reference_solution`/`solution`). Send on turn 1 (or when updating), and omit or send `null` on subsequent turns. |
+| `current_code` | `string \| null` | No | Complete code currently in the student's editor. |
+| `executed_code` | `string \| null` | No | Exact code used in the student's most recent execution. |
+| `output_error` | `object \| null` | No | Separate runtime/output error object from the runner, if any. |
+| `validation_feedback` | `object \| null` | No | Complete Code Runner `POST /run?view=tutor` JSON payload. Do not pre-filter fields on the backend. |
+| `recent_messages` | `array` | Legacy (optional) | Retained only for backwards compatibility during backend migration. `ai-server` **ignores** any supplied `recent_messages` and reads history from SQLite instead. |
 
-  ----------------------------------------------------------------------------------------
-  Field                   Type                          Required Description
-  ----------------------- ---------------- --------------------- -------------------------
-  `conversation_id`       string                             Yes Backend's conversation
-                                                                 identifier. Must contain
-                                                                 1--128 non-whitespace
-                                                                 characters. It is echoed
-                                                                 in the response.
+### `lab_context` Object Fields
 
-  `message`               string                             Yes Student's latest message.
-                                                                 Must not be empty or
-                                                                 whitespace-only.
+| Field | Accepted Aliases | Description | Visibility to Student |
+| :--- | :--- | :--- | :--- |
+| `title` | — | Lab title (`string \| null`) | Safe reference |
+| `instructions` | — | Lab prompt / problem statement (`string \| null`) | Safe reference |
+| `starter_code` | `starter` | Starter code given to students (`string \| null`) | Safe reference |
+| `tests` | — | Lab unit test source (`string \| null`) | **Private teacher-only reference** — never revealed to students |
+| `reference_solution` | `solution` | Reference solution code (`string \| null`) | **Private teacher-only reference** — never revealed to students |
 
-  `recent_messages`       array                               No Recent conversation
-                                                                 history. Defaults to
-                                                                 `[]`. Each item has
-                                                                 `role` and `content`.
+`starter` and `solution` are accepted as aliases so the backend can pass fields straight from `public.labs`. Empty/whitespace-only string fields inside `lab_context` are ignored.
 
-  `current_code`          string or `null`      Yes, key must be Complete code currently
-                                                         present present in the editor.
-                                                                 Use `null` when
-                                                                 unavailable.
+---
 
-  `executed_code`         string or `null`      Yes, key must be Exact code submitted in
-                                                         present the student's most recent
-                                                                 execution. Use `null`
-                                                                 when no execution is
-                                                                 available.
+## 4. Idempotency Key (`idempotency_key` / `Idempotency-Key`)
 
-  `output_error`          object or `null`      Yes, key must be Runtime/output error
-                                                         present information available
-                                                                 from the runner. Use
-                                                                 `null` when unavailable.
+### What it is
+An **idempotency key** is a unique string generated per student turn (for example, a UUID v4 or the backend's `turn_id` / client `Idempotency-Key` header) sent on `POST /api/v1/tutor`.
 
-  `validation_feedback`   object or `null`      Yes, key must be Complete Code Runner
-                                                         present response from
-                                                                 `POST /run?view=tutor`.
-                                                                 Use `null` when no
-                                                                 validation/execution
-                                                                 feedback is available.
-  ----------------------------------------------------------------------------------------
+You can send it in either place:
+* HTTP header: `Idempotency-Key: <key>`
+* JSON body: `"idempotency_key": "<key>"`
 
-**Important:** The nullable fields must still be included in the JSON
-request. Send `null` rather than omitting the keys.
+If both are provided, the JSON body `idempotency_key` takes precedence. Keys are trimmed and capped at 128 characters.
 
-### `recent_messages` item format
+### Why it is needed
+Because `ai-server` now owns the conversation history in SQLite, network timeouts or backend retries (such as your lease-recovery worker retrying an in-flight turn) could otherwise cause the same student message to be processed twice — costing double OpenRouter calls and inserting duplicate user/assistant turns into `ai-server`'s history.
 
-Each history item must have:
+### Lifecycle & Behavior Rules
 
-``` json
-{
-  "role": "user",
-  "content": "The student's earlier message"
-}
+1. **Saved only after OpenRouter succeeds (`200`):** `ai-server` calls OpenRouter first, and only writes the turn to `messages` and `turns` once a valid response is returned.
+2. **Duplicate retry after success -> cached replay:** If the backend retries a request with the same `(conversation_id, idempotency_key)` that already succeeded, `ai-server` immediately returns the saved `answer` and `sources` without calling OpenRouter or appending duplicate rows.
+3. **Failure (`400`, `422`, `429`, `503`, `500`) -> nothing saved:** If OpenRouter rate-limits (`429`), times out (`503`), or fails (`500`), neither the messages nor the `idempotency_key` are stored. Retrying with the **same** `idempotency_key` runs the turn cleanly.
+4. **New turns require a new key:** Every new student message must use a new `idempotency_key`. Reusing an old key on the same `conversation_id` will return that earlier turn's cached response.
+5. **Scoped per conversation:** Uniqueness is `(conversation_id, idempotency_key)`.
+
+---
+
+## 5. Examples
+
+### Turn 1: Initial Student Question (with `lab_context` and `Idempotency-Key`)
+
+```http
+POST /api/v1/tutor
+Content-Type: application/json
+Idempotency-Key: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+Authorization: Bearer <TUTOR_API_TOKEN>
 ```
 
-Allowed roles:
-
--   `user`
--   `assistant`
-
-`content` must be a non-empty string.
-
-Send prior conversation messages in chronological order (oldest first).
-The current student message goes in the top-level `message` field; do
-not duplicate it as the latest item in `recent_messages`.
-
-### Example request
-
-This example represents a coding-help turn where the student has not run
-the code yet:
-
-``` json
+```json
 {
   "conversation_id": "conv-123",
   "message": "Why does my loop only print the first number?",
-  "recent_messages": [
-    {
-      "role": "user",
-      "content": "I am trying to print all values in a list."
-    },
-    {
-      "role": "assistant",
-      "content": "What part of your code controls which list element is printed?"
-    }
-  ],
-  "current_code": "def print_numbers(nums):\n    for i in range(len(nums)):\n        return nums[i]",
+  "lab_context": {
+    "title": "Print All Elements",
+    "instructions": "Write a function that returns a list of all numbers doubled.",
+    "starter": "def double_all(nums):\n    pass",
+    "tests": "assert double_all([1, 2, 3]) == [2, 4, 6]",
+    "solution": "def double_all(nums):\n    return [n * 2 for n in nums]"
+  },
+  "current_code": "def double_all(nums):\n    for n in nums:\n        return n * 2",
   "executed_code": null,
   "output_error": null,
   "validation_feedback": null
 }
 ```
 
-### Example request after a runner execution
+### Turn 2: Follow-up After Code Runner Execution (`lab_context` & `recent_messages` omitted)
 
-When the Code Runner has produced tutor-view feedback, send the
-**complete `view=tutor` response** in `validation_feedback`. Do not
-pre-filter its fields on the backend. The Seekhein API sanitizes the
-feedback before it is added to the tutor context.
+`ai-server` automatically loads Turn 1's messages and the pinned `lab_context` from SQLite:
 
-``` json
+```http
+POST /api/v1/tutor
+Content-Type: application/json
+Idempotency-Key: 109156be-c4fb-41ea-b1b4-efe1671c5836
+Authorization: Bearer <TUTOR_API_TOKEN>
+```
+
+```json
 {
   "conversation_id": "conv-123",
-  "message": "Why did my submission fail?",
-  "recent_messages": [],
-  "current_code": "def maximum(nums):\n    return nums[0]",
-  "executed_code": "def maximum(nums):\n    return nums[0]",
+  "message": "I moved return out of the loop, why did one test still fail?",
+  "current_code": "def double_all(nums):\n    out = []\n    for n in nums:\n        out.append(n)\n    return out",
+  "executed_code": "def double_all(nums):\n    out = []\n    for n in nums:\n        out.append(n)\n    return out",
   "output_error": null,
   "validation_feedback": {
     "status": "ok",
-    "score": 2,
+    "score": 0,
     "ran": 1,
-    "passed": 2,
+    "passed": 0,
     "failed": 1,
-    "total": 3,
+    "total": 1,
     "duration_ms": 12,
     "passed_tests": [],
     "failures": []
@@ -187,162 +178,74 @@ feedback before it is added to the tutor context.
 }
 ```
 
-The `validation_feedback` above is a shortened illustrative example. In
-actual integration, pass the complete JSON object returned by the Code
-Runner's `view=tutor` response, including its available diagnostic
-fields.
+### Successful Response (`200 OK`)
 
-If the runner has a separate output/runtime error object, send it in
-`output_error`. If no such error exists, send `null`.
-
-------------------------------------------------------------------------
-
-## 3. Scenario handling
-
-The backend does **not** need to send a `scenario` field. The Seekhein
-context builder determines the scenario from `output_error` and
-`validation_feedback`.
-
-Current scenario selection:
-
-  -----------------------------------------------------------------------
-  Input condition                     Scenario selected internally
-  ----------------------------------- -----------------------------------
-  Both `output_error` and             `combined_feedback`
-  `validation_feedback` are present
-
-  Only `output_error` is present      `runtime_error`
-
-  `validation_feedback.status` is     `runtime_error`
-  `syntax_error`, `runtime_error`,
-  `timeout`, `oom`, or
-  `internal_error`
-
-  Other non-null                      `submission_feedback`
-  `validation_feedback`
-
-  Both feedback fields are `null`     `coding`
-  -----------------------------------------------------------------------
-
-Do not add or send a `scenario` property unless the API contract is
-explicitly changed.
-
-------------------------------------------------------------------------
-
-## 4. Successful response
-
-A successful request returns JSON in this shape:
-
-``` json
+```json
 {
   "status": "success",
   "conversation_id": "conv-123",
-  "answer": "Let's inspect the return statement. What happens when Python reaches it during the first loop iteration?",
+  "answer": "Look closely at what you append inside the loop. Are you appending the original number or its doubled value?",
   "sources": []
 }
 ```
 
-  -----------------------------------------------------------------------
-  Field                   Type                    Description
-  ----------------------- ----------------------- -----------------------
-  `status`                string                  `"success"` when the
-                                                  request is processed
-                                                  successfully.
+### Reset / Delete Session (`DELETE /api/v1/sessions/{conversation_id}`)
 
-  `conversation_id`       string                  The same conversation
-                                                  identifier sent in the
-                                                  request.
+Call this when a user deletes or resets a conversation so its SQLite history, idempotency keys, and pinned `lab_context` are wiped:
 
-  `answer`                string                  Socratic tutor response
-                                                  to display to the
-                                                  student.
+```http
+DELETE /api/v1/sessions/conv-123
+Authorization: Bearer <TUTOR_API_TOKEN>
+```
 
-  `sources`               array                   Retrieved
-                                                  learning-material
-                                                  source metadata. Treat
-                                                  the entries as source
-                                                  metadata; do not assume
-                                                  a fixed item schema
-                                                  unless separately
-                                                  agreed.
-  -----------------------------------------------------------------------
+Response (`200 OK`):
 
-The frontend should display `answer` as the tutor's response. `sources`
-can be used by the application if it displays learning-material
-references.
+```json
+{
+  "status": "success",
+  "conversation_id": "conv-123",
+  "deleted": true
+}
+```
 
-------------------------------------------------------------------------
+(`deleted` is `false` if no session existed for that ID; the endpoint is idempotent.)
 
-## 5. Error responses
+---
 
-Handle non-2xx responses rather than assuming every request succeeds.
+## 6. Internal Scenario Selection
 
-  -----------------------------------------------------------------------
-  HTTP status             Meaning                 Backend handling
-  ----------------------- ----------------------- -----------------------
-  `400`                   Request reached the API Read the response
-                          but a message/context   `detail`; correct the
-                          validation error was    request or show an
-                          raised.                 appropriate error.
+The backend does **not** send a `scenario` field. `agent/context_builder.py` derives it from `output_error` and `validation_feedback`:
 
-  `422`                   Request body failed     Check field names,
-                          FastAPI/Pydantic schema types, required keys,
-                          validation.             and `recent_messages`
-                                                  item structure.
+| Input condition | Internal scenario |
+| :--- | :--- |
+| Both `output_error` and `validation_feedback` are non-null | `combined_feedback` |
+| Only `output_error` is non-null | `runtime_error` |
+| `validation_feedback.status` is `syntax_error`, `runtime_error`, `timeout`, `oom`, or `internal_error` | `runtime_error` |
+| Other non-null `validation_feedback` | `submission_feedback` |
+| Both feedback fields are `null` | `coding` |
 
-  `500`                   Unexpected internal API Log the
-                          error.                  request/conversation
-                                                  identifier and response
-                                                  status; do not expose
-                                                  internal server details
-                                                  to the student.
-  -----------------------------------------------------------------------
+---
 
-The API returns a generic message for unexpected internal errors rather
-than exposing the underlying exception.
+## 7. Error Responses
 
-------------------------------------------------------------------------
+| HTTP status | Meaning | Backend handling |
+| :--- | :--- | :--- |
+| `400` | Application validation error (e.g., empty message/ID, oversized `Idempotency-Key` header) | Read `detail`; fix request payload/headers. Turn was not saved. |
+| `401` | Missing or invalid `Authorization: Bearer <TUTOR_API_TOKEN>` at Caddy edge proxy | Check `TUTOR_API_TOKEN` in backend environment. |
+| `422` | FastAPI/Pydantic schema validation failed | Check field types and required keys (`conversation_id`, `message`). Turn was not saved. |
+| `429` | OpenRouter upstream rate limit (`RateLimitError` or HTTP 429) | Retryable; turn was **not** saved, so retry with the same `idempotency_key`. |
+| `503` | OpenRouter timeout, connection error, or upstream 5xx | Retryable; turn was **not** saved, so retry with the same `idempotency_key`. |
+| `500` | Unexpected internal server error | Log status + `conversation_id`; do not expose internal details to the student. Turn was not saved. |
 
-## 6. Backend integration checklist
+---
 
--   [ ] Send `POST /api/v1/tutor` with `Content-Type: application/json`.
--   [ ] Include `conversation_id` and the student's latest `message`.
--   [ ] Include `recent_messages` as
-    `{ "role": "user" | "assistant", "content": "..." }` objects.
--   [ ] Send the complete editor contents as `current_code`, or `null`.
--   [ ] Send the exact code from the latest execution as
-    `executed_code`, or `null`.
--   [ ] Include `output_error` and `validation_feedback` keys even when
-    their values are `null`.
--   [ ] Pass the complete Code Runner `view=tutor` response as
-    `validation_feedback`; do not filter it on the backend.
--   [ ] Do not send a `scenario` field; the API derives it.
--   [ ] Display the returned `answer` to the student.
--   [ ] Preserve and resend recent conversation history on each request.
--   [ ] Handle `400`, `422`, and `500` responses.
--   [ ] Test the full flow from the student interface through the
-    backend, runner feedback, tutor API, and back to the interface.
+## 8. Backend Integration Checklist
 
-------------------------------------------------------------------------
-
-## 7. Important integration notes
-
-1.  **Conversation history:** `conversation_id` is accepted and returned
-    by the API, but the backend must send `recent_messages` on each
-    request. Do not rely on the tutor API to retrieve prior turns by
-    conversation ID.
-2.  **Code fields:** `current_code` is the current editor state.
-    `executed_code` is the code associated with the latest run. They may
-    differ.
-3.  **Runner feedback:** Send the full Code Runner tutor-view response.
-    Sanitization is performed inside Seekhein before the data is used as
-    tutor context.
-4.  **Nullable values:** Use explicit JSON `null` for unavailable code
-    or feedback values.
-5.  **Deployment URL:** Configure the API base URL per environment. A
-    service running remotely cannot call another machine's `127.0.0.1`
-    address.
-
-For the current request schema and response details, the interactive
-FastAPI documentation at `/docs` is the source of truth for the running
-API version.
+- [ ] Set `TUTOR_API_URL` (e.g. `https://tutor.<ip>.sslip.io`) and `TUTOR_API_TOKEN` in backend environment variables.
+- [ ] Send `POST /api/v1/tutor` with `Authorization: Bearer <TUTOR_API_TOKEN>` and `Content-Type: application/json`.
+- [ ] Send a unique `Idempotency-Key` header (or `idempotency_key` body field) per turn, and reuse the same key on retries.
+- [ ] Send `lab_context` (`title`, `instructions`, `starter`, `tests`, `solution`) on turn 1 (or whenever updated); omit or send `null` on follow-up turns.
+- [ ] Stop querying/sending `recent_messages` to `ai-server` (or pass `[]` during transition — it is ignored).
+- [ ] Send `current_code`, `executed_code`, `output_error`, and the full Code Runner `view=tutor` JSON as `validation_feedback`.
+- [ ] Handle `429` and `503` as transient/retryable failures, and `400`/`422`/`500` appropriately.
+- [ ] Optionally call `DELETE /api/v1/sessions/{conversation_id}` when deleting or resetting a chat conversation.

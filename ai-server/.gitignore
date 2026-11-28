@@ -34,6 +34,7 @@ chroma_db/
 Thumbs.db
 
 # Local development databases and test artifacts
+data/
 local_data/
 test_chroma_lab03/
 test_chroma_lab03_structured/
