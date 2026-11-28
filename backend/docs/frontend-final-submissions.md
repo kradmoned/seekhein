@@ -441,6 +441,7 @@ Apply each migration once, in this order, to the existing application schema:
    Existing rows default to false and all previous outcomes remain unchanged.
 8. `20261128_003_ai_chat.sql`: server-only tutor execution output and student chat
    tables. See [AI assistant integration](frontend-ai-assistant.md).
+9. `20261128_004_stateful_tutor.sql`: stateful AI protocol, recovery and cleanup.
 
 Old executions remain practice attempts. Existing false policies become a
 limit of 1; true policies become unlimited. No accepted versions are removed.

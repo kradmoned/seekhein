@@ -489,24 +489,33 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 
 ## Student AI assistant
 
-Apply `db/migrations/20261128_003_ai_chat.sql` after
-Submit anyway, configure `TUTOR_API_URL`, and deploy the runner with `view=both`.
-An optional `TUTOR_API_TOKEN` is only for deployments supporting Bearer authentication.
+Apply `20261128_003_ai_chat.sql`, then `20261128_004_stateful_tutor.sql` after
+Submit anyway. Stop/drain old workers first; the protocol migration refuses
+active processing turns. Configure server-only `TUTOR_API_URL` and the deployed
+Caddy `TUTOR_API_TOKEN`. The runner must support `view=both`.
 
-Students create/list lab conversations and post questions to
-`/api/conversations/{conversationId}/messages`. The backend sends three completed
-student/assistant exchanges (six messages), the new question, current editor code,
-and exact saved execution context to the stateless Socratic tutor. Messages share
-conversation/turn IDs. Full tutor diagnostics stay server-side. Student Run adds
-`attempt_id`; accepted final `submission_id` values can also select context.
+Students create/list lab conversations and post to
+`/api/conversations/{conversationId}/messages`. The backend stores browser-visible
+messages and exact execution snapshots. The AI owns model history in SQLite:
+**set `MAX_HISTORY_TURNS=3` on the AI server** to retain three question/answer
+exchanges. The backend no longer queries/sends `recent_messages`.
 
-Concurrent students are isolated. Per-conversation leases, durable snapshots,
-idempotency keys, and atomic answer persistence support retries and reloads.
-AI requests run outside database transactions. Rate limits are shared in PostgreSQL.
+Lab context is sent initially and when updated, from trusted lab records. Each
+backend turn UUID is forwarded as the AI Idempotency-Key. Uncertain outcomes block
+new messages until the turn is recovered. POST
+`/api/conversations/{conversationId}/turns/{turnId}/recover` recovers using the
+saved snapshot, even after browser storage loss. DELETE
+`/api/conversations/{conversationId}` coordinates remote/local cleanup. Reset
+creates a fresh conversation UUID after cleanup. Old protocol-1 conversations
+remain readable but cannot receive new questions.
+
+Student Run exposes `attempt_id`; accepted final IDs can also select context.
+Private tutor/lab context stays server-side. Different students can chat in
+parallel; leases, rate limits, and recovery are coordinated through PostgreSQL.
 
 See [the frontend AI assistant contract](docs/frontend-ai-assistant.md) for routes,
-response/error types, configuration, migration, history, and recovery details.
-Real-database verification (isolated schema; mocked auth and AI):
+frontend changes, migration, configuration, and recovery/deletion semantics.
+Database verification (isolated schema, simulated stateful AI):
 
 ```bash
 node --env-file=.env.local tests/integration/chat.test.mjs
