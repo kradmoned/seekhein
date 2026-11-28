@@ -1,3 +1,4 @@
+
 # Environment variables and secrets
 .env
 .env.*
@@ -18,10 +19,8 @@ __pycache__/
 .coverage
 htmlcov/
 
-# ChromaDB and local vector databases
+# Local ChromaDB databases
 chroma_db/
-test_chroma_lab03/
-test_chroma_lab03_structured/
 
 # Logs
 *.log
@@ -33,3 +32,11 @@ test_chroma_lab03_structured/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local development databases and test artifacts
+local_data/
+test_chroma_lab03/
+test_chroma_lab03_structured/
+
+# Outdated or local lab manuals
+knowledge_base/lab_manuals/
