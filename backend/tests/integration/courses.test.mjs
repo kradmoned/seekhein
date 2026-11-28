@@ -48,11 +48,11 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
           total_tests: 1, ran_tests: 1, passed_tests: 1, failed_tests: 0,
           tests: [{ index: 1, name: "test_a", display_name: "Test A", status: "passed", passed: true, duration_ms: 1 }],
         } }),
-        runCode: async () => {
+        runCodeWithTutor: async () => {
           runnerCalls++
-          return { status: "ok", results: [{ name: "Test 1", passed: true, error: null }], score: 100, passed: 1, total: 1,
+          return { tutor: { status: "ok" }, student: { status: "ok", results: [{ name: "Test 1", passed: true, error: null }], score: 100, passed: 1, total: 1,
             ran: 1, failed: 0, stdout: "", stdout_truncated: false, duration_ms: 1,
-            tests: [{ index: 1, name: "test_a", display_name: "Test A", status: "passed", passed: true, duration_ms: 1 }] }
+            tests: [{ index: 1, name: "test_a", display_name: "Test A", status: "passed", passed: true, duration_ms: 1 }] } }
         },
       }
     }
@@ -135,6 +135,11 @@ test("course membership protects every lab entry point", { skip: !process.env.DA
     const anywayColumns = await db.query("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'submissions' AND column_name = 'submit_anyway'")
     if (!anywayColumns.rows.length) {
       const migration = readFileSync(path.join(root, "db/migrations/20261128_002_submit_anyway.sql"), "utf8")
+      await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
+    }
+    const tutorColumns = await db.query("SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'submissions' AND column_name = 'tutor_output'")
+    if (!tutorColumns.rows.length) {
+      const migration = readFileSync(path.join(root, "db/migrations/20261128_003_ai_chat.sql"), "utf8")
       await db.query(migration.replace(/^BEGIN;\s*/, "").replace(/COMMIT;\s*$/, ""))
     }
 

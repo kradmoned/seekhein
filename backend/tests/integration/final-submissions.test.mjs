@@ -1,3 +1,4 @@
+import { bothViews } from "../helpers/runner.mjs"
 import assert from "node:assert/strict"
 import { createHash, randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
@@ -108,7 +109,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
           })
           runnerCalls++
           executed.push(JSON.parse(init.body))
-          return Response.json(runnerBehavior ? await runnerBehavior() : passed())
+          return Response.json(bothViews(runnerBehavior ? await runnerBehavior() : passed()))
         },
         require: (name) => name.startsWith("node:") ? require(name) : load(path.resolve(path.dirname(filename), `${name}.ts`)),
       }, { filename })
@@ -161,6 +162,7 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
     await query(readFileSync(path.join(root, "db/migrations/20261127_004_lab_validation.sql"), "utf8"))
     await query(readFileSync(path.join(root, "db/migrations/20261128_001_runner_output.sql"), "utf8"))
     await query(readFileSync(path.join(root, "db/migrations/20261128_002_submit_anyway.sql"), "utf8"))
+    await query(readFileSync(path.join(root, "db/migrations/20261128_003_ai_chat.sql"), "utf8"))
     await scenario("migration preserves existing runs as practice and defaults old labs to locked policy", async () => {
       const legacy = await query("SELECT l.allow_resubmissions,s.kind,s.code FROM public.labs l JOIN public.submissions s ON s.lab_id=l.id WHERE l.id=$1", [legacyLab])
       assert.equal(legacy.rows[0].allow_resubmissions, false)
@@ -513,7 +515,8 @@ test("final submission routes and concurrency against PostgreSQL", { skip: !proc
       try {
         const practice = await learner.run.POST(new Request("http://localhost", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: fixtureCode }) }), context(lab))
         assert.equal(practice.status, 200)
-        const body = await practice.json()
+        const { attempt_id: practiceId, ...body } = await practice.json()
+        assert.ok(practiceId)
         assert.equal(body.stdout, stdout)
         assert.deepEqual(body.syntax_error, syntax)
         assert.deepEqual((await query("SELECT execution_output FROM public.submissions WHERE lab_id=$1 AND kind='practice'", [lab])).rows[0].execution_output, body)

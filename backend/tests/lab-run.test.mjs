@@ -1,3 +1,4 @@
+import { bothViews } from "./helpers/runner.mjs"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import path from "node:path"
@@ -27,7 +28,7 @@ function harness(options = {}) {
     fetch: async (url, init) => {
       requests.push({ url: String(url), ...init })
       if (options.fetch) return options.fetch(url, init)
-      return Response.json(options.result ?? runnerResult())
+      return Response.json(bothViews(options.result ?? runnerResult()))
     },
   }
   function load(relative) {
@@ -43,7 +44,7 @@ function harness(options = {}) {
         queries.push({ sql, values })
         if (options.dbError) throw new Error(secret)
         if (options.saveError && sql.includes("INSERT INTO public.submissions")) throw new Error(secret)
-        return { rows: options.rows ?? [{ tests }] }
+        return { rows: options.rows ?? [{ tests, id: labId }] }
       } } }
     }
     if (cache.has(filename)) return cache.get(filename)
@@ -95,6 +96,7 @@ test("run returns and stores every documented student-view field plus legacy res
   delete expected.tests[1].detail
   assert.deepEqual(body, {
     ...expected,
+    attempt_id: labId,
     results: [
       { name: "Test 1", passed: true, error: null },
       { name: "Test 2", passed: false, error: "Test failed" },
@@ -106,7 +108,7 @@ test("run returns and stores every documented student-view field plus legacy res
   assert.match(h.queries[0].sql, /JOIN public.courses/)
   assert.match(h.queries[0].sql, /public.course_enrollments/)
   assert.equal(JSON.stringify(h.queries[0].values), JSON.stringify([labId, "student", labId]))
-  assert.equal(h.requests[0].url, "http://runner.test:8081/run?view=student")
+  assert.equal(h.requests[0].url, "http://runner.test:8081/run?view=both")
   assert.deepEqual(JSON.parse(h.requests[0].body), { code, tests })
   assert.equal(h.requests[0].headers["X-Internal-Key"], "server-test-key")
   assert.equal(h.requests[0].headers.Authorization, undefined)
@@ -115,7 +117,7 @@ test("run returns and stores every documented student-view field plus legacy res
   assert.equal(h.queries[1].values[1], labId)
   assert.equal(h.queries[1].values[2], code)
   assert.doesNotMatch(h.queries[1].values[4], new RegExp(secret))
-  assert.deepEqual(JSON.parse(h.queries[1].values[8]), body)
+  assert.deepEqual(JSON.parse(h.queries[1].values[8]), Object.fromEntries(Object.entries(body).filter(([key]) => key !== "attempt_id")))
 })
 
 test("teacher preview runs do not create student submissions", async () => {
@@ -211,7 +213,7 @@ for (const status of ["syntax_error", "runtime_error", "timeout", "oom", "intern
       assert.deepEqual(body.syntax_error, result.syntax_error)
       assert.deepEqual(body.tests, [])
       assert.equal(body.internal_error, undefined)
-      assert.deepEqual(JSON.parse(h.queries[1].values[8]), body)
+      assert.deepEqual(JSON.parse(h.queries[1].values[8]), Object.fromEntries(Object.entries(body).filter(([key]) => key !== "attempt_id")))
     } else assert.ok(!JSON.stringify(body).includes(secret))
   })
 }
@@ -222,7 +224,7 @@ for (const result of [null, {}, { ...runnerResult(), score: 100 }, { ...runnerRe
   { ...runnerResult(), tests: runnerResult().tests.map((test) => ({ ...test, traceback: [{ line: "3", function: "add", code: "return 1" }] })) },
 ]) {
   test("malformed or inconsistent runner result fails closed", async () => {
-    const h = harness({ fetch: async () => Response.json(result) })
+    const h = harness({ fetch: async () => Response.json(bothViews(result)) })
     const response = await h.run()
     assert.equal(response.status, 502)
     assert.doesNotMatch(await response.text(), new RegExp(secret))
@@ -253,4 +255,21 @@ test("30-second deadline covers the complete runner request", async () => {
     fetch: async () => { signal.aborted = true; throw new Error("aborted") },
   })
   assert.equal((await h.run()).status, 504)
+})
+
+
+test("both views come from one request and tutor diagnostics never reach the browser", async () => {
+  const h = harness()
+  const body = await (await h.run()).json()
+  assert.equal(h.requests.length, 1)
+  assert.equal(body.attempt_id, labId)
+  assert.doesNotMatch(JSON.stringify(body), /PRIVATE_TUTOR/)
+  assert.deepEqual(JSON.parse(h.queries[1].values[9]), bothViews(runnerResult()).tutor)
+})
+test("mismatched runner views fail before persistence", async () => {
+  const envelope = bothViews(runnerResult())
+  envelope.tutor.total = 99
+  const h = harness({ fetch: async () => Response.json(envelope) })
+  assert.equal((await h.run()).status, 502)
+  assert.equal(h.queries.length, 1)
 })

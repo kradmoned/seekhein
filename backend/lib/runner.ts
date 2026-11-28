@@ -96,6 +96,10 @@ function studentResult(data: unknown) {
 }
 
 export async function runCode(code: string, tests: string) {
+  return (await runCodeWithTutor(code, tests)).student
+}
+
+export async function runCodeWithTutor(code: string, tests: string) {
   if (Buffer.byteLength(code, "utf8") > maxSourceBytes) {
     throw new RunnerError(413, "Code must be at most 64 KiB")
   }
@@ -103,13 +107,25 @@ export async function runCode(code: string, tests: string) {
     throw new RunnerError(422, "This lab exceeds the runner's test size limit. Contact your teacher.")
   }
 
-  return studentResult((await requestRunner("/run?view=student", { code, tests })).data)
+  const data = (await requestRunner("/run?view=both", { code, tests })).data
+  if (!isObject(data) || !isObject(data.tutor)) return invalidResponse()
+  const student = studentResult(data.student)
+  const tutor = data.tutor
+  // Validate the envelope and shared execution identity without filtering the
+  // tutor payload. Complete diagnostics are forwarded only to the AI service.
+  for (const field of ["status", "score", "ran", "passed", "failed", "total", "duration_ms"] as const) {
+    if (tutor[field] !== student[field]) return invalidResponse()
+  }
+  if (!Array.isArray(tutor.passed_tests) || tutor.passed_tests.length !== student.passed ||
+    tutor.passed_tests.some((name) => typeof name !== "string") || !Array.isArray(tutor.failures) ||
+    tutor.failures.length !== student.total - student.passed || tutor.failures.some((failure) => !isObject(failure))) return invalidResponse()
+  return { student, tutor }
 }
 
 // Only server-chosen paths and source are sent. Browser credentials and raw
 // infrastructure error bodies must never pass through this boundary.
 export async function requestRunner(
-  endpoint: "/run?view=student" | "/validate",
+  endpoint: "/run?view=both" | "/validate",
   payload: { code: string; tests: string } | { solution: string; tests: string },
 ) {
   let url: URL
