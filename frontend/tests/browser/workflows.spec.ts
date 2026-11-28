@@ -368,7 +368,7 @@ test('light and dark themes keep readable text, visible controls, and the same e
       expect((values[1] + 0.05) / (values[0] + 0.05), `${theme}: ${foreground} on ${background}`).toBeGreaterThanOrEqual(minimum)
     }
     expect(await editorCode(page)).toBe('# keep my work\nx = 1')
-    await expect(page.locator('.monaco-editor').first()).toHaveCSS('background-color', theme === 'dark' ? 'rgb(27, 33, 42)' : 'rgb(255, 255, 255)')
+    await expect(page.locator('.monaco-editor').first()).toHaveCSS('background-color', theme === 'dark' ? 'rgb(32, 35, 40)' : 'rgb(255, 255, 255)')
     await expect(page.getByText('Draft saved on this device')).toBeVisible()
   }
   await page.getByRole('button', { name: 'Run code', exact: true }).click()

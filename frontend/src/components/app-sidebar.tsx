@@ -50,7 +50,7 @@ export function AppSidebar() {
           </span>
           <span>
             <span className="block text-xl font-semibold leading-6">
-              Seekhein.
+              Seekhein<span className="text-primary">.</span>
             </span>
             <span className="block text-xs text-muted-foreground">
               Python learning workspace
