@@ -1,10 +1,18 @@
 
-# Environment variables (API keys)
+# Environment variables and API keys
 .env
 
-# Virtual environment
+# Virtual environments
 .venv/
 
-# Python cache files
+# Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# ChromaDB
+chroma_db/
+**/chroma_db/
+
+# Lab manuals and course materials
+knowledge_base/lab_manuals/
