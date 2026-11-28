@@ -16,3 +16,7 @@ chroma_db/
 
 # Lab manuals and course materials
 knowledge_base/lab_manuals/
+
+# Local test vector databases
+/test_chroma_lab03/
+/test_chroma_lab03_structured/

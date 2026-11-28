@@ -1,0 +1,201 @@
+{
+  "lab_metadata": {
+    "course": "Computer Fundamentals and Programming",
+    "lab_number": "03",
+    "lab_type": "Graded Lab",
+    "prepared_by": "Dr. Nouman Shamim",
+    "email": "nauman@pieas.edu.pk",
+    "instructors": [
+      "Afaq Ahmed",
+      "Aimen Wadood",
+      "Nouman Shamim"
+    ],
+    "grading_note": "Complete a minimum of 4 activities from Section-03. Each activity has 25% weight.",
+    "lab_work_note": "The lab work of a session should be completed with all questions resolved before the next lab session."
+  },
+  "sections": [
+    {
+      "section_id": "section_01",
+      "title": "Reading and Syntax",
+      "description": "Read this section to revise concepts related to arrays. For while loop, consult the lecture slides.",
+      "topics": [
+        {
+          "title": "Arrays",
+          "content": "An array is a sequence of objects all having the same data types, stored at contiguous memory locations. The objects in an array are called elements. Array elements are accessed using an index starting from 0 in C/C++.",
+          "examples": [
+            {
+              "code": "int A[10];",
+              "explanation": "Creates an array of 10 integers."
+            },
+            {
+              "code": "int A[10], B[10];",
+              "explanation": "Creates two arrays of 10 integers each."
+            },
+            {
+              "code": "float A[10];",
+              "explanation": "Creates an array of 10 floats."
+            },
+            {
+              "code": "char A[10];",
+              "explanation": "Creates an array of 10 characters."
+            }
+          ]
+        },
+        {
+          "title": "Declaring Array",
+          "syntax": "type arrayName[size];",
+          "exception": {
+            "description": "An array can also be declared using a variable. The variable must be declared and initialized before using it as the array size.",
+            "code": "int size = 10;\nint A[size];"
+          }
+        },
+        {
+          "title": "Initializing Array",
+          "methods": [
+            {
+              "method": "Method-1: Just like variables",
+              "code": "int A[5];\nA[0] = 1;\nA[1] = 2;\nA[2] = 3;\nA[3] = 4;\nA[4] = 5;"
+            },
+            {
+              "method": "Method-2: Using loops",
+              "code": "int A[5], n = 0;\nwhile (n < 5) {\n    A[n] = n + 1;\n    n = n + 1;\n}"
+            },
+            {
+              "method": "Method-3: Using initializer list",
+              "code": "int A[5] = {1, 2, 3, 4, 5};",
+              "note": "If fewer values are provided, the remaining elements are initialized to 0.",
+              "example": "int A[5] = {1, 2, 3};"
+            },
+            {
+              "method": "Method-4: Without size",
+              "code": "int A[] = {1, 2, 3, 4, 5};",
+              "note": "The size of the array is equal to the number of elements in the initializer list."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "section_id": "section_02",
+      "title": "Working With Arrays",
+      "description": "This section provides example programs for handling arrays along with simple tasks to exercise the concepts.",
+      "topics": [
+        {
+          "title": "Accessing and displaying array elements",
+          "description": "Array elements can be accessed and used by means of their indexes.",
+          "example": {
+            "array_declaration": "int A[5] = {2, 4, 6, 8, 10};",
+            "method_1": "printf(\"%d,%d,%d,%d,%d\", A[0], A[1], A[2], A[3], A[4]);",
+            "method_2": "int n = 0;\nwhile (n < 5) {\n    printf(\"%d \", A[n]);\n    n = n + 1;\n}"
+          }
+        },
+        {
+          "title": "Example Program-01",
+          "purpose": "Declare an array of 5 integers, initialize it using a complete initializer list, and display the values stored in its elements.",
+          "code": "#include <stdio.h>\nint main() {\n    int A[5] = {1, 2, 3, 4, 5};\n    int index = 0;\n    while (index < 5) {\n        printf(\"%d\\n\", A[index]);\n        index = index + 1;\n    }\n    return 0;\n}"
+        },
+        {
+          "title": "Example Program-02",
+          "purpose": "Declare an array of 5 integers, initialize it using an incomplete initializer list, and display the values stored in its elements.",
+          "code": "#include <stdio.h>\nint main() {\n    int A[5] = {1, 2, 3};\n    int index = 0;\n    while (index < 5) {\n        printf(\"%d\", A[index]);\n        index = index + 1;\n    }\n    return 0;\n}",
+          "note": "The remaining array elements are initialized to 0."
+        },
+        {
+          "title": "Example Program-03",
+          "purpose": "Declare two arrays, initialize them using initializer lists, and display the sum of their values.",
+          "code_as_presented_in_lab": "#include <stdio.h>\nvoid main() {\n    int A[5] = {1, 2, 3, 4, 5};\n    int B[5] = {6, 7, 8, 9, 10};\n    int index = 0;\n    while (index < 5) {\n        printf(\"A[%d] = %d\\n\", index, A[index]);\n        index = index + 1;\n    }\n    index = 0;\n    while (index < 5) {\n        printf(\"B[%d] = %d\\n\", index, B[index]);\n        index = index + 1;\n    }\n    index = 0;\n    printf(\"Displaying sum of elements of two arrays\\n\");\n    while (index < 5) {\n        printf(\"A[%d] + B[%d] = %d\", index, index, A[index] + B[index]);\n        index = index + 1;\n    }\n}",
+          "note": "The extracted source text contains apparent typographical/OCR errors in this example. The code above normalizes the evident variable and printf spellings while preserving the intended operations."
+        }
+      ]
+    },
+    {
+      "section_id": "section_03",
+      "title": "Activities",
+      "instructions": "Each activity provides a sample problem statement and programming solution or guidance. Complete the activities by extending the given programming solutions as directed.",
+      "activities": [
+        {
+          "activity_number": 1,
+          "title": "Find Square of Array Elements",
+          "task": "Use Example Program-03 and update it into a new program that finds the square of each element of array A and stores these squares in array B. Finally, display the contents of both arrays.",
+          "sample_output": {
+            "array_A": [
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "array_B": [
+              1,
+              4,
+              9,
+              16,
+              25
+            ]
+          }
+        },
+        {
+          "activity_number": 2,
+          "title": "Store Even and Odd Numbers in Different Arrays",
+          "task": "Get five numbers from the user using the console. Create two integer arrays of size 5 named array_even and array_odd. As each number is entered, check whether it is even or odd. Store even numbers in array_even and odd numbers in array_odd. Ignore the number otherwise. After input is complete, display the even and odd numbers by displaying the contents of the two arrays."
+        },
+        {
+          "activity_number": 3,
+          "title": "Re-arrange an Array",
+          "description": "Re-arrangement changes the positions of array elements. For example, for A[5] = {8, 5, 9, 11, 20}, the arrangement scheme [4, 0, 1, 2, 3] places the element at index 4 at position 0, the element at index 0 at position 1, and the element at index 1 at position 2.",
+          "task": "Create an array of 5 elements named arr_original and initialize it using an initializer list with values between 1 and 100. Create another array of 5 elements named arr_order and initialize it with an arrangement scheme (the example scheme may be used). Create a third array named arr_arranged and copy elements from arr_original into arr_arranged according to the arrangement scheme stored in arr_order.",
+          "advanced_version": "Initialize arr_original and arr_order using user input, then rearrange arr_original."
+        },
+        {
+          "activity_number": 4,
+          "title": "Find the Tuple of Maximum Sum",
+          "task": "Create an array of 10 elements and let the user enter the values. Find the two array elements whose sum is greater than the sum of any other pair of array elements. Print those two elements.",
+          "example": {
+            "array": [
+              20,
+              5,
+              13,
+              7,
+              11
+            ],
+            "maximum_sum_pair": [
+              20,
+              13
+            ]
+          }
+        },
+        {
+          "activity_number": 5,
+          "title": "Find Maximum of an Array",
+          "parts": [
+            {
+              "part": "a",
+              "task": "Extend the program that finds the largest number from three given numbers. Rewrite it to find the smallest or largest of 10 numbers. Store the numbers in an array and process the array to obtain the desired result."
+            },
+            {
+              "part": "b",
+              "task": "Extend the previous program to find the largest and smallest of N numbers, where the handout states N < 10 and N > 20. After finding the smallest and largest numbers, store the largest number at the beginning of the array and the smallest number at the end. For an array named A, A[0] should contain the largest number and A[N] should contain the smallest number."
+            }
+          ],
+          "source_note": "The condition 'N < 10 and N > 20' is reproduced as printed in the handout and appears contradictory. Confirm the intended condition with the instructor."
+        },
+        {
+          "activity_number": 6,
+          "title": "Swapping Arrays",
+          "task": "Get 6 numbers from the user and store them in two arrays A and B, each containing 3 elements. Display both arrays, then exchange their values so that the values in A are replaced by the values in B and the values in B are replaced by the values in A. Finally, display the new values of A and B.",
+          "hint": "You might need a third array."
+        },
+        {
+          "activity_number": 7,
+          "title": "Merge and Reverse Two Arrays",
+          "task": "Merge two arrays of integers into a third array and then reverse the merged array. Include error checking to ensure that the user inputs valid integer values. Display the contents of both original arrays and the reversed merged array."
+        }
+      ]
+    }
+  ],
+  "source_notes": [
+    "The lab manual's first page states that at least 4 activities from Section-03 must be completed and that each activity has 25% weight.",
+    "The lab manual covers arrays and while loops; it advises consulting lecture slides for while-loop concepts.",
+    "Activity 5(b) contains a contradictory N condition in the source text; it has been preserved and flagged rather than silently corrected."
+  ]
+}
