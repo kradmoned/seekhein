@@ -353,7 +353,8 @@ Show a neutral **Telemetry incomplete** label when `telemetry_status` is missing
 or missing the opening event. A score of 100 with missing telemetry should
 not be presented as evidence of observed clean activity. Display event text
 using React text nodes. The report contains no clipboard contents or hidden
-test source. `chat_available` remains false until tutor chat storage exists.
+test source. `chat_available` remains false for this teacher report: student
+assistant chats are stored separately and are not exposed through this endpoint.
 
 Each student also receives `practice_attempt_count`, `accepted_submission`, and
 `integrity_scope: "current_lab"`. The accepted-submission shape is specified in

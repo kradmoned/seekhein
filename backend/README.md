@@ -145,7 +145,8 @@ Apply the course migration above before using the updated lab routes.
 `POST /api/labs/{id}/run` requires authentication and accepts only
 `{"code":"Python source from the student's editor"}`. Enrolled students and the
 course's teacher can run a lab. The backend fetches the complete `tests` text from Postgres and
-sends `{code, tests}` to the runner's `/run?view=student` endpoint. It does not use
+sends `{code, tests}` to the runner's `/run?view=both` endpoint and returns only
+the student view (plus the saved `attempt_id`). It does not use
 the stored starter or reference solution as the submitted code.
 
 Configure these server-only variables in `.env.local`, then restart the backend:
@@ -363,8 +364,9 @@ curl "http://localhost:3000/api/labs/$LAB_ID/report" \
 `GET /api/labs/{id}/report` is restricted to the course's teacher. It includes
 enrolled students plus students with historical activity, execution summaries,
 event timelines, and computed integrity scores sorted ascending. Reports omit
-submitted source, test source, and reference solutions. Chat storage is absent,
-so `chat_available` is false. Scores are computed on read and never persisted.
+submitted source, test source, and reference solutions. Student assistant chats
+are stored separately and are not exposed by teacher integrity reports; their
+`chat_available` field remains false. Scores are computed on read and never persisted.
 
 | Rule | Deduction |
 | --- | --- |
@@ -483,3 +485,29 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+
+## Student AI assistant
+
+Apply `db/migrations/20261128_003_ai_chat.sql` after
+Submit anyway, configure `TUTOR_API_URL`, and deploy the runner with `view=both`.
+An optional `TUTOR_API_TOKEN` is only for deployments supporting Bearer authentication.
+
+Students create/list lab conversations and post questions to
+`/api/conversations/{conversationId}/messages`. The backend sends three completed
+student/assistant exchanges (six messages), the new question, current editor code,
+and exact saved execution context to the stateless Socratic tutor. Messages share
+conversation/turn IDs. Full tutor diagnostics stay server-side. Student Run adds
+`attempt_id`; accepted final `submission_id` values can also select context.
+
+Concurrent students are isolated. Per-conversation leases, durable snapshots,
+idempotency keys, and atomic answer persistence support retries and reloads.
+AI requests run outside database transactions. Rate limits are shared in PostgreSQL.
+
+See [the frontend AI assistant contract](docs/frontend-ai-assistant.md) for routes,
+response/error types, configuration, migration, history, and recovery details.
+Real-database verification (isolated schema; mocked auth and AI):
+
+```bash
+node --env-file=.env.local tests/integration/chat.test.mjs
+```
