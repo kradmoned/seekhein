@@ -12,18 +12,24 @@ function subscribeDesktop(callback: () => void) {
 /** A split that preserves mounted children while resizing, including Monaco's model. */
 export function ResizableSplit({
   first, second, direction = 'horizontal', defaultSize = 40,
-  minFirst = 200, minSecond = 200, desktopOnly = false, label, className,
+  minFirst = 200, minSecond = 200, desktopOnly = false, label, className, storageKey, secondOpen = true, secondOnMobile = false,
 }: {
   first: ReactNode; second: ReactNode; direction?: 'horizontal' | 'vertical';
   defaultSize?: number; minFirst?: number; minSecond?: number; desktopOnly?: boolean;
-  label: string; className?: string;
+  label: string; className?: string; storageKey?: string; secondOpen?: boolean; secondOnMobile?: boolean;
 }) {
   const desktop = useSyncExternalStore(subscribeDesktop, () => window.matchMedia(desktopQuery).matches, () => true)
   const enabled = !desktopOnly || desktop
   const horizontal = direction === 'horizontal'
   const root = useRef<HTMLDivElement>(null)
   const drag = useRef<{ pointerId: number; start: number; size: number } | null>(null)
-  const [size, setSize] = useState(defaultSize)
+  const [size, updateSize] = useState(() => {
+    try { const saved = storageKey ? localStorage.getItem(storageKey) : null; const value = Number(saved); return saved !== null && Number.isFinite(value) && value >= 10 && value <= 90 ? value : defaultSize } catch { return defaultSize }
+  })
+  function setSize(value: number) {
+    updateSize(value)
+    try { if (storageKey) localStorage.setItem(storageKey, String(value)) } catch { /* Resizing works without persistence. */ }
+  }
   const [dragging, setDragging] = useState(false)
   const id = useId()
   function extent() {
@@ -43,16 +49,16 @@ export function ResizableSplit({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
   }
   const track = `minmax(0, ${size}fr) ${dividerSize}px minmax(0, ${100 - size}fr)`
-  return <div ref={root} data-slot="resizable-group" className={cn('relative min-h-0 min-w-0', !enabled && 'flex flex-col gap-1', className)}
-    style={enabled ? { display: 'grid', [horizontal ? 'gridTemplateColumns' : 'gridTemplateRows']: track } : undefined}>
-    <div id={`${id}-first`} className="min-h-0 min-w-0 overflow-hidden">{first}</div>
+  return <div ref={root} data-slot="resizable-group" className={cn('relative min-h-0 min-w-0', (!enabled || !secondOpen) && 'flex flex-col gap-1', className)}
+    style={enabled && secondOpen ? { display: 'grid', [horizontal ? 'gridTemplateColumns' : 'gridTemplateRows']: track } : undefined}>
+    <div id={`${id}-first`} className={cn("min-h-0 min-w-0 overflow-hidden", !secondOpen && "flex-1", secondOnMobile && !desktop && "hidden")}>{first}</div>
     <div
-      role="separator" tabIndex={enabled ? 0 : -1} aria-label={label}
+      role="separator" tabIndex={enabled && secondOpen ? 0 : -1} aria-label={label}
       aria-orientation={horizontal ? 'vertical' : 'horizontal'} aria-controls={`${id}-first ${id}-second`}
       aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(size)}
       aria-valuetext={`${Math.round(size)} percent ${horizontal ? 'left' : 'top'} panel`}
       title="Drag or use arrow keys to resize. Double-click to reset."
-      className={cn('group relative z-10 flex touch-none items-center justify-center rounded-sm outline-none hover:bg-primary/10 focus-visible:bg-primary/10 focus-visible:ring-2 focus-visible:ring-ring', horizontal ? 'cursor-col-resize after:absolute after:inset-y-0 after:-inset-x-1' : 'cursor-row-resize after:absolute after:inset-x-0 after:-inset-y-1', !enabled && 'hidden', dragging && 'bg-primary/10')}
+      className={cn('group relative z-10 flex touch-none items-center justify-center rounded-sm outline-none hover:bg-primary/10 focus-visible:bg-primary/10 focus-visible:ring-2 focus-visible:ring-ring', horizontal ? 'cursor-col-resize after:absolute after:inset-y-0 after:-inset-x-1' : 'cursor-row-resize after:absolute after:inset-x-0 after:-inset-y-1', (!enabled || !secondOpen) && 'hidden', dragging && 'bg-primary/10')}
       onPointerDown={event => {
         if (event.button !== 0) return
         event.preventDefault()
@@ -79,7 +85,7 @@ export function ResizableSplit({
       }}>
       <span aria-hidden="true" className={cn('rounded-full bg-muted-foreground/60 transition-colors group-hover:bg-primary/50 group-focus-visible:bg-primary/50', horizontal ? 'h-6 w-0.5' : 'h-0.5 w-6')} />
     </div>
-    <div id={`${id}-second`} className="min-h-0 min-w-0 overflow-hidden">{second}</div>
+    <div id={`${id}-second`} className={cn("min-h-0 min-w-0 overflow-hidden", !secondOpen && "hidden", secondOnMobile && !desktop && "h-[80dvh] flex-1")}>{second}</div>
     {dragging && <div className={cn('pointer-events-none absolute inset-0 z-20 select-none', horizontal ? 'cursor-col-resize' : 'cursor-row-resize')} />}
   </div>
 }
