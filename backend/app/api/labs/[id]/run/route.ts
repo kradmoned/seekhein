@@ -4,7 +4,7 @@ import { courseAccessSql } from "../../../../../lib/courses"
 import { readCode } from "../../../../../lib/code-request"
 import { HttpError } from "../../../../../lib/http"
 import {
-  runCode,
+  runCodeWithTutor,
   RunnerError,
 } from "../../../../../lib/runner"
 
@@ -38,18 +38,20 @@ export async function POST(
       return Response.json({ error: "Lab not found" }, { status: 404 })
     }
 
-    const resultForStudent = await runCode(code, lab.tests)
+    const { student: resultForStudent, tutor } = await runCodeWithTutor(code, lab.tests)
+    let attemptId: string | null = null
     if (user.role === "student") {
-      await pool.query(
+      const saved = await pool.query<{ id: string }>(
         `INSERT INTO public.submissions
-           (lab_id, student_id, code, status, results, score, passed, total, execution_output)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::json)`,
+           (lab_id, student_id, code, status, results, score, passed, total, execution_output, tutor_output)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::json, $10::json) RETURNING id`,
         [id, user.id, code, resultForStudent.status,
           JSON.stringify(resultForStudent.results), resultForStudent.score,
-          resultForStudent.passed, resultForStudent.total, JSON.stringify(resultForStudent)],
+          resultForStudent.passed, resultForStudent.total, JSON.stringify(resultForStudent), JSON.stringify(tutor)],
       )
+      attemptId = saved.rows[0].id
     }
-    return Response.json(resultForStudent, {
+    return Response.json({ ...resultForStudent, attempt_id: attemptId }, {
       headers: { "Cache-Control": "private, no-store" },
     })
   } catch (error) {

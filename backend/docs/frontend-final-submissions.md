@@ -85,7 +85,7 @@ reads and Submit responses use `Cache-Control: private, no-store`.
 | Route | Role and request | Success |
 | --- | --- | --- |
 | `PATCH /api/labs/{id}` | Course owner; JSON `{max_submissions: number \| null}` | `200 {id, max_submissions, allow_resubmissions}` |
-| `POST /api/labs/{id}/run` | Enrolled student or course owner; JSON `{code}` | `200 ExecutionResult` |
+| `POST /api/labs/{id}/run` | Enrolled student or course owner; JSON `{code}` | `200 ExecutionResult & {attempt_id: string \| null}` |
 | `POST /api/labs/{id}/submit` | Enrolled student; JSON `{code, submit_anyway?: boolean}` and UUID `Idempotency-Key` header | `200 SubmitResult` |
 | `GET /api/labs/{id}/submission` | Enrolled student; no body | `200 SubmissionStatus` |
 | `GET /api/courses/{courseId}/students/{studentId}/report` | Course owner; no body | `200 StudentCourseReport` |
@@ -439,6 +439,9 @@ Apply each migration once, in this order, to the existing application schema:
 7. `20261128_002_submit_anyway.sql`: explicit submission mode on requests and
    saved work, updated final-validity constraint, and matching-mode database guard.
    Existing rows default to false and all previous outcomes remain unchanged.
+8. `20261128_003_ai_chat.sql`: server-only tutor execution output and student chat
+   tables. See [AI assistant integration](frontend-ai-assistant.md).
+9. `20261128_004_stateful_tutor.sql`: stateful AI protocol, recovery and cleanup.
 
 Old executions remain practice attempts. Existing false policies become a
 limit of 1; true policies become unlimited. No accepted versions are removed.

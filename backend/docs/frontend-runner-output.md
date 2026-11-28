@@ -1,14 +1,17 @@
 # Complete student runner output
 
 Student Run and Submit now return all documented fields from CodeRunner's
-`/run?view=student` response. The old compact `results` array is retained for
+`student` member of the runner's `/run?view=both` response. The old compact `results` array is retained for
 compatibility. Read `tests`, `stdout`, and `syntax_error` for the console UI.
 
 This intentionally exposes test labels, inputs, expected/actual values, exception
 messages, student-code traceback frames, and captured output when the runner
 provides them. Do not assume those values are confidential. Reference solution
 and test source files are still not returned. The backend does not switch to
-`view=tutor` or `view=full`; fields exclusive to those views are not forwarded.
+`view=tutor` or `view=full`; tutor-only fields are saved server-side and are not
+forwarded to the browser. Student Run also returns `attempt_id` for chat context
+selection; teacher previews return `attempt_id: null`. See the
+[AI assistant contract](frontend-ai-assistant.md).
 
 ## Response type
 
@@ -63,7 +66,7 @@ student view. Errors originating in the test suite may lack `syntax_error`.
 
 | Endpoint | Response |
 | --- | --- |
-| `POST /api/labs/{id}/run` | HTTP 200 with `ExecutionResult` directly |
+| `POST /api/labs/{id}/run` | HTTP 200 with `ExecutionResult` plus `attempt_id: string \| null` |
 | `POST /api/labs/{id}/submit` | Existing wrapper; `execution` contains `ExecutionResult` |
 | `GET /api/labs/{id}/submission` | Accepted submission's `execution` contains the saved full output for new records |
 | `GET /api/submissions/{submissionId}` | Owner-only exact code plus the saved full execution output for new records |

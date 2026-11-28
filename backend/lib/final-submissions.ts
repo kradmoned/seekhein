@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { pool } from "./db"
 import { HttpError } from "./http"
-import { runCode } from "./runner"
+import { runCodeWithTutor } from "./runner"
 
 export class SubmissionError extends HttpError {
   constructor(status: number, public code: string, message: string) {
@@ -74,7 +74,7 @@ export async function submitFinal(labId: string, studentId: string, key: string,
         error: "The accepted submission limit for this lab has been reached",
       } }
     } else {
-      const execution = await runCode(code, lab.tests)
+      const { student: execution, tutor } = await runCodeWithTutor(code, lab.tests)
       const passedAllTests = execution.status === "ok" && execution.total > 0 && execution.passed === execution.total
       const accepted = passedAllTests || submitAnyway
       let submissionId: string | null = null
@@ -82,11 +82,11 @@ export async function submitFinal(labId: string, studentId: string, key: string,
       if (accepted) {
         const saved = await client.query<{ id: string; created_at: Date }>(
           `INSERT INTO public.submissions
-             (lab_id, student_id, code, status, results, score, passed, total, kind, request_id, code_sha256, execution_output, submit_anyway)
-           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, 'final', $9, $10, $11::json, $12)
+             (lab_id, student_id, code, status, results, score, passed, total, kind, request_id, code_sha256, execution_output, submit_anyway, tutor_output)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, 'final', $9, $10, $11::json, $12, $13::json)
            RETURNING id, created_at`,
           [labId, studentId, code, execution.status, JSON.stringify(execution.results), execution.score,
-            execution.passed, execution.total, request.id, createHash("sha256").update(code, "utf8").digest("hex"), JSON.stringify(execution), submitAnyway],
+            execution.passed, execution.total, request.id, createHash("sha256").update(code, "utf8").digest("hex"), JSON.stringify(execution), submitAnyway, JSON.stringify(tutor)],
         )
         submissionId = saved.rows[0].id
         submittedAt = saved.rows[0].created_at.toISOString()

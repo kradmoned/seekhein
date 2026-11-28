@@ -145,7 +145,8 @@ Apply the course migration above before using the updated lab routes.
 `POST /api/labs/{id}/run` requires authentication and accepts only
 `{"code":"Python source from the student's editor"}`. Enrolled students and the
 course's teacher can run a lab. The backend fetches the complete `tests` text from Postgres and
-sends `{code, tests}` to the runner's `/run?view=student` endpoint. It does not use
+sends `{code, tests}` to the runner's `/run?view=both` endpoint and returns only
+the student view (plus the saved `attempt_id`). It does not use
 the stored starter or reference solution as the submitted code.
 
 Configure these server-only variables in `.env.local`, then restart the backend:
@@ -363,8 +364,9 @@ curl "http://localhost:3000/api/labs/$LAB_ID/report" \
 `GET /api/labs/{id}/report` is restricted to the course's teacher. It includes
 enrolled students plus students with historical activity, execution summaries,
 event timelines, and computed integrity scores sorted ascending. Reports omit
-submitted source, test source, and reference solutions. Chat storage is absent,
-so `chat_available` is false. Scores are computed on read and never persisted.
+submitted source, test source, and reference solutions. Student assistant chats
+are stored separately and are not exposed by teacher integrity reports; their
+`chat_available` field remains false. Scores are computed on read and never persisted.
 
 | Rule | Deduction |
 | --- | --- |
@@ -483,3 +485,38 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+
+## Student AI assistant
+
+Apply `20261128_003_ai_chat.sql`, then `20261128_004_stateful_tutor.sql` after
+Submit anyway. Stop/drain old workers first; the protocol migration refuses
+active processing turns. Configure server-only `TUTOR_API_URL` and the deployed
+Caddy `TUTOR_API_TOKEN`. The runner must support `view=both`.
+
+Students create/list lab conversations and post to
+`/api/conversations/{conversationId}/messages`. The backend stores browser-visible
+messages and exact execution snapshots. The AI owns model history in SQLite:
+**set `MAX_HISTORY_TURNS=3` on the AI server** to retain three question/answer
+exchanges. The backend no longer queries/sends `recent_messages`.
+
+Lab context is sent initially and when updated, from trusted lab records. Each
+backend turn UUID is forwarded as the AI Idempotency-Key. Uncertain outcomes block
+new messages until the turn is recovered. POST
+`/api/conversations/{conversationId}/turns/{turnId}/recover` recovers using the
+saved snapshot, even after browser storage loss. DELETE
+`/api/conversations/{conversationId}` coordinates remote/local cleanup. Reset
+creates a fresh conversation UUID after cleanup. Old protocol-1 conversations
+remain readable but cannot receive new questions.
+
+Student Run exposes `attempt_id`; accepted final IDs can also select context.
+Private tutor/lab context stays server-side. Different students can chat in
+parallel; leases, rate limits, and recovery are coordinated through PostgreSQL.
+
+See [the frontend AI assistant contract](docs/frontend-ai-assistant.md) for routes,
+frontend changes, migration, configuration, and recovery/deletion semantics.
+Database verification (isolated schema, simulated stateful AI):
+
+```bash
+node --env-file=.env.local tests/integration/chat.test.mjs
+```
