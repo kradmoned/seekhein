@@ -68,36 +68,59 @@ function tutorHarness(options = {}) {
   } })
   return { ...load('lib/tutor.ts'), requests }
 }
-const context = { conversation_id: id, message: 'New question', recent_messages: [], current_code: null, executed_code: null, output_error: null, validation_feedback: null }
+const context = { conversation_id: id, message: 'New question', current_code: null, executed_code: null, output_error: null, validation_feedback: null }
 test('tutor adapter forwards all feedback intact and sends explicit nulls without scenario', async () => {
   const h = tutorHarness({ env: { TUTOR_API_TOKEN: 'server-only' } })
   const feedback = { failures: [{ detail: '<test_suite>\n\u0000full details' }], arbitrary: { intact: true } }
-  const answer = await h.askTutor({ ...context, validation_feedback: feedback })
+  const answer = await h.askTutor({ ...context, validation_feedback: feedback, lab_context: { title: "Lab", instructions: "Prompt", starter: "pass", tests: "PRIVATE_TESTS", solution: "PRIVATE_SOLUTION" } }, id)
   assert.equal(answer.answer, 'Think about the loop.')
   assert.equal(h.requests[0].url, 'http://tutor.test/api/v1/tutor')
-  assert.deepEqual(JSON.parse(h.requests[0].body), { ...context, validation_feedback: feedback })
+  const sent = JSON.parse(h.requests[0].body)
+  assert.deepEqual(sent.validation_feedback, feedback)
+  assert.equal(sent.lab_context.tests, 'PRIVATE_TESTS')
+  assert.equal('recent_messages' in sent, false)
+  assert.equal('idempotency_key' in sent, false)
+  assert.equal(h.requests[0].headers['Idempotency-Key'], id)
   assert.equal(h.requests[0].headers.Authorization, 'Bearer server-only')
   assert.equal(h.requests[0].redirect, 'error')
 })
 test('AI errors and malformed answers never expose upstream internals', async () => {
-  for (const [upstream, expected] of [[400,502], [422,502], [500,502], [429,429], [503,503]]) {
+  for (const [upstream, expected] of [[400,502], [401,503], [403,503], [422,502], [500,502], [429,429], [503,503]]) {
     const h = tutorHarness({ fetch: async () => Response.json({ detail: 'PRIVATE_DETAIL' }, { status: upstream }) })
-    await assert.rejects(h.askTutor(context), (e) => e.status === expected && !e.message.includes('PRIVATE_DETAIL'))
+    await assert.rejects(h.askTutor(context, id), (e) => e.status === expected && !e.message.includes('PRIVATE_DETAIL'))
   }
   for (const response of [null, {}, { status: 'success', conversation_id: randomUUID(), answer: 'x', sources: [] },
     { status: 'success', conversation_id: id, answer: '\0', sources: [] },
     { status: 'success', conversation_id: id, answer: 'x'.repeat(32769), sources: [] },
     { status: 'success', conversation_id: id, answer: 'x', sources: {} }]) {
     const h = tutorHarness({ fetch: async () => Response.json(response) })
-    await assert.rejects(h.askTutor(context), (e) => e.status === 502)
+    await assert.rejects(h.askTutor(context, id), (e) => e.status === 502)
   }
-  await assert.rejects(tutorHarness({ fetch: async () => new Response('x'.repeat(262145)) }).askTutor(context), (e) => e.status === 502)
+  await assert.rejects(tutorHarness({ fetch: async () => new Response('x'.repeat(262145)) }).askTutor(context, id), (e) => e.status === 502)
 })
 test('missing tutor URL is a configuration error; deadlines cover the complete request', async () => {
   const h = tutorHarness({ env: { TUTOR_API_URL: '' } })
-  await assert.rejects(h.askTutor(context), (e) => e.status === 503)
+  await assert.rejects(h.askTutor(context, id), (e) => e.status === 503)
   assert.equal(h.requests.length, 0)
   const signal = { aborted: false }
   const timed = tutorHarness({ abortSignal: { timeout(ms) { assert.equal(ms, 45000); return signal } }, fetch: async () => { signal.aborted = true; throw new Error('timeout') } })
-  await assert.rejects(timed.askTutor(context), (e) => e.status === 504)
+  await assert.rejects(timed.askTutor(context, id), (e) => e.status === 504)
+})
+
+
+test('tutor cleanup is authenticated and treats an absent session as success', async () => {
+  for (const deleted of [true, false]) {
+    const h = tutorHarness({ env: { TUTOR_API_TOKEN: 'server-token' }, response: { status: 'success', conversation_id: id, deleted } })
+    await h.deleteTutorSession(id)
+    assert.equal(h.requests[0].url, `http://tutor.test/api/v1/sessions/${id}`)
+    assert.equal(h.requests[0].method, 'DELETE')
+    assert.equal(h.requests[0].headers.Authorization, 'Bearer server-token')
+    assert.equal(h.requests[0].body, undefined)
+  }
+  await assert.rejects(tutorHarness({ response: { status: 'success', conversation_id: randomUUID(), deleted: true } }).deleteTutorSession(id), (e) => e.outcomeUnknown)
+})
+test('transport loss and malformed success are uncertain; documented failures are definite', async () => {
+  await assert.rejects(tutorHarness({ fetch: async () => { throw new Error('lost response') } }).askTutor(context, id), (e) => e.outcomeUnknown)
+  await assert.rejects(tutorHarness({ response: {} }).askTutor(context, id), (e) => e.outcomeUnknown)
+  await assert.rejects(tutorHarness({ fetch: async () => Response.json({}, { status: 503 }) }).askTutor(context, id), (e) => !e.outcomeUnknown)
 })

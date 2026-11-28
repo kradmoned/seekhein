@@ -12,24 +12,28 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
   const query = (sql, args) => db.query(rewrite(sql), args)
   const student = randomUUID(), second = randomUUID(), outsider = randomUUID(), teacher = randomUUID(), lab = randomUUID(), otherLab = randomUUID(), course = randomUUID()
   const feedback = { status: 'runtime_error', internal_error: 'PRIVATE_TRACE\u0000FULL', failures: [{ detail: 'PRIVATE_TEST_SOURCE' }], custom: { untouched: true } }
-  let failSave = false, loseCommit = false
+  let failSave = false, loseCommit = false, failCleanupSave = false, loseAIResponse = false
   const adapter = {
     query,
     async connect() {
       const client = await db.connect()
+      let wroteAssistant = false
       return {
         async query(sql, args) {
           if (failSave && sql.includes("'assistant'")) { failSave = false; throw new Error('Simulated save failure') }
+          if (sql.includes("'assistant'")) wroteAssistant = true
+          if (failCleanupSave && sql.startsWith('DELETE FROM public.chat_turns')) { failCleanupSave = false; throw new Error('Cleanup storage failure') }
           const result = await client.query(rewrite(sql), args)
-          if (loseCommit && sql === 'COMMIT') { loseCommit = false; throw new Error('Lost COMMIT acknowledgement') }
+          if (loseCommit && wroteAssistant && sql === 'COMMIT') { loseCommit = false; throw new Error('Lost COMMIT acknowledgement') }
           return result
         },
         release: (destroy) => client.release(destroy),
       }
     },
   }
-  const captured = []
-  let tutorBehavior
+  const captured = [], upstreamKeys = [], remoteDeletes = []
+  const remoteTurns = new Map(), remoteHistory = new Map()
+  let modelCalls = 0, tutorBehavior, deleteBehavior
   const load = loader({ modules: {
     'lib/db.ts': { pool: adapter },
     'lib/auth.ts': { requireUser: async (req, role) => {
@@ -40,14 +44,39 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
     } },
   }, globals: {
     process: { env: { TUTOR_API_URL: 'http://tutor.test' } },
-    fetch: async (_url, init) => {
+    fetch: async (url, init) => {
+      if (init.method === 'DELETE') {
+        const conversation = new URL(url).pathname.split('/').at(-1)
+        remoteDeletes.push(conversation)
+        if (deleteBehavior) return deleteBehavior(conversation)
+        const existed = remoteHistory.delete(conversation)
+        for (const key of remoteTurns.keys()) if (key.startsWith(conversation + ':')) remoteTurns.delete(key)
+        return Response.json({ status: 'success', conversation_id: conversation, deleted: existed })
+      }
       const context = JSON.parse(init.body); captured.push(context)
-      if (tutorBehavior) return tutorBehavior(context)
-      return Response.json({ status: 'success', conversation_id: context.conversation_id, answer: `Hint for ${context.message}`, sources: [{ arbitrary: 'metadata' }] })
+      const key = init.headers['Idempotency-Key']; upstreamKeys.push(key)
+      assert.ok(key)
+      assert.equal('recent_messages' in context, false)
+      const scoped = `${context.conversation_id}:${key}`
+      if (remoteTurns.has(scoped)) return Response.json(remoteTurns.get(scoped))
+      modelCalls++
+      const response = tutorBehavior ? await tutorBehavior(context) : Response.json({ status: 'success', conversation_id: context.conversation_id, answer: `Hint for ${context.message}`, sources: [{ arbitrary: 'metadata' }] })
+      if (response.status === 200) {
+        const answer = await response.clone().json()
+        if (!remoteTurns.has(scoped)) {
+          remoteTurns.set(scoped, answer)
+          remoteHistory.set(context.conversation_id, [...(remoteHistory.get(context.conversation_id) ?? []), context.message])
+        }
+        if (loseAIResponse) { loseAIResponse = false; throw new Error('Response lost after remote success') }
+        return Response.json(remoteTurns.get(scoped))
+      }
+      return response
     },
   } })
   const conversations = load('app/api/labs/[id]/conversations/route.ts')
   const messages = load('app/api/conversations/[conversationId]/messages/route.ts')
+  const recovery = load('app/api/conversations/[conversationId]/turns/[turnId]/recover/route.ts')
+  const cleanup = load('app/api/conversations/[conversationId]/route.ts')
   const request = (user = student, body, key = randomUUID(), queryString = '') => new Request(`http://localhost/${queryString}`, {
     method: body === undefined ? 'GET' : 'POST', headers: { 'x-test-user': user, 'Content-Type': 'application/json', 'Idempotency-Key': key },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -59,6 +88,8 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
   }
   const params = (id) => ({ params: Promise.resolve({ conversationId: id }) })
   const send = (id, body = { message: 'Why?', current_code: null }, key = randomUUID(), user = student) => messages.POST(request(user, body, key), params(id))
+  const recover = (id, turnId, user = student) => recovery.POST(request(user), { params: Promise.resolve({ conversationId: id, turnId }) })
+  const remove = (id, user = student) => cleanup.DELETE(request(user), params(id))
   async function read(id, user = student, page = '') {
     const response = await messages.GET(request(user, undefined, randomUUID(), page), params(id))
     assert.equal(response.status, 200)
@@ -66,16 +97,16 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
   }
   const accepted = async (response) => { assert.equal(response.status, 200, await response.clone().text()); return response.json() }
   async function scenario(name, fn) {
-    await t.test(name, async () => {
+    await t.test(name, { skip: !!process.env.CHAT_CASE && !new RegExp(process.env.CHAT_CASE).test(name) }, async () => {
       await query('DELETE FROM public.chat_dispatches')
       try { await fn() } catch (error) { t.diagnostic(error.stack); throw error }
-      finally { tutorBehavior = undefined; failSave = false; loseCommit = false }
+      finally { tutorBehavior = undefined; deleteBehavior = undefined; failSave = false; loseCommit = false; failCleanupSave = false; loseAIResponse = false }
     })
   }
   try {
     await db.query(`CREATE SCHEMA ${schema}`)
     await query(`CREATE TABLE public.profiles(id uuid PRIMARY KEY);
-      CREATE TABLE public.labs(id uuid PRIMARY KEY,course_id uuid NOT NULL);
+      CREATE TABLE public.labs(id uuid PRIMARY KEY,course_id uuid NOT NULL,title text DEFAULT 'Lab',instructions text DEFAULT 'Prompt',starter text DEFAULT 'pass',tests text DEFAULT 'PRIVATE_TEST_SOURCE',solution text DEFAULT 'PRIVATE_SOLUTION');
       CREATE TABLE public.course_enrollments(course_id uuid NOT NULL,student_id uuid NOT NULL,PRIMARY KEY(course_id,student_id));
       CREATE TABLE public.submissions(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),lab_id uuid NOT NULL,student_id uuid NOT NULL,code text NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp());
       CREATE FUNCTION public.reject_activity_mutation() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'Append only'; END;$$;`)
@@ -83,6 +114,9 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
     await query('INSERT INTO public.profiles(id) VALUES ($1),($2),($3),($4)', [student, second, outsider, teacher])
     await query('INSERT INTO public.labs(id,course_id) VALUES ($1,$2),($3,$4)', [lab, course, otherLab, randomUUID()])
     await query('INSERT INTO public.course_enrollments(course_id,student_id) VALUES ($1,$2),($1,$3)', [course, student, second])
+    const legacy = (await query('INSERT INTO public.chat_conversations(student_id,lab_id) VALUES ($1,$2) RETURNING id', [student,lab])).rows[0].id
+    await query(readFileSync(new URL('../../db/migrations/20261128_004_stateful_tutor.sql', import.meta.url), 'utf8'))
+
     const execution = (await query('INSERT INTO public.submissions(lab_id,student_id,code,tutor_output) VALUES ($1,$2,$3,$4::json) RETURNING id', [lab, student, 'executed code', JSON.stringify(feedback)])).rows[0].id
 
     await scenario('conversation ownership, enrollment and role checks protect all routes', async () => {
@@ -96,17 +130,20 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
       assert.equal((await conversations.GET(request(student), { params: Promise.resolve({ id: lab }) })).status, 200)
       assert.equal(captured.length, 0)
     })
-    await scenario('three completed exchanges, exact execution context, replay and reload', async () => {
+    await scenario('pinned lab context, upstream keys, exact execution context and reload', async () => {
       const conv = await create()
       for (let i=1; i<=4; i++) {
-        await accepted(await send(conv, { message: `Question ${i}`, current_code: `edited ${i}`, attempt_id: execution }))
+        const reply = await accepted(await send(conv, { message: `Question ${i}`, current_code: `edited ${i}`, attempt_id: execution }))
+        assert.equal(upstreamKeys.at(-1), reply.turn_id)
+        if (i === 1) assert.equal(captured.at(-1).lab_context.solution, 'PRIVATE_SOLUTION')
+        else assert.equal(captured.at(-1).lab_context, undefined)
       }
       const key = randomUUID(), input = { message: 'Question 5', current_code: 'new unexecuted code', attempt_id: execution }
       const answer = await accepted(await send(conv, input, key))
       assert.equal(captured.at(-1).executed_code, 'executed code')
       assert.equal(captured.at(-1).current_code, input.current_code)
       assert.deepEqual(captured.at(-1).validation_feedback, feedback)
-      assert.deepEqual(captured.at(-1).recent_messages, [2,3,4].flatMap((i) => [{ role: 'user', content: `Question ${i}` }, { role: 'assistant', content: `Hint for Question ${i}` }]))
+      assert.equal('recent_messages' in captured.at(-1), false)
       assert.equal('scenario' in captured.at(-1), false)
       const before = captured.length
       assert.deepEqual(await accepted(await send(conv, input, key)), answer)
@@ -147,9 +184,10 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
       try {
         assert.equal((await send(first, undefined, key)).status, 409)
         assert.equal((await send(first)).status, 409)
+        assert.equal((await remove(first)).status, 409)
         await accepted(await send(other, undefined, randomUUID(), second))
         assert.equal(captured.at(-1).conversation_id, other)
-        assert.deepEqual(captured.at(-1).recent_messages, [])
+        assert.equal('recent_messages' in captured.at(-1), false)
       } finally { release() }
       await accepted(await inFlight)
     })
@@ -159,18 +197,19 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
       assert.equal((await send(conv, input, key)).status, 500)
       const original = captured.at(-1)
       const failed = await read(conv)
-      assert.equal(failed.turns[0].status, 'failed')
+      assert.equal(failed.turns[0].status, 'recovery_required')
+      assert.equal(failed.can_send, false)
+      assert.equal((await send(conv)).status, 409)
+      assert.equal((await remove(conv)).status, 409)
       assert.equal(failed.turns[0].messages.length, 1)
       await query('INSERT INTO public.submissions(lab_id,student_id,code) VALUES ($1,$2,$3)', [lab, student, 'later execution'])
-      tutorBehavior = (context) => {
-        assert.deepEqual(context, original)
-        loseCommit = true
-        return Response.json({ status: 'success', conversation_id: conv, answer: 'Saved answer', sources: [] })
-      }
+      loseCommit = true
       assert.equal((await send(conv, input, key)).status, 500)
+      assert.deepEqual(captured.at(-1), original)
       const before = captured.length
       const replay = await accepted(await send(conv, input, key))
-      assert.equal(replay.answer, 'Saved answer')
+      assert.equal(replay.answer, 'Hint for Recover')
+      assert.deepEqual(remoteHistory.get(conv), ['Recover'])
       assert.equal(captured.length, before)
       assert.equal((await read(conv)).turns[0].messages.length, 2)
     })
@@ -194,7 +233,90 @@ test('chat persistence, context isolation and recovery against PostgreSQL', { sk
       assert.equal((await send(conv, { message: 'Failed turn', current_code: null })).status, 502)
       tutorBehavior = undefined
       await accepted(await send(conv, { message: 'After failure', current_code: null }))
-      assert.deepEqual(captured.at(-1).recent_messages.map((m) => m.content), ['Expired worker','Hint for Expired worker'])
+      assert.deepEqual(remoteHistory.get(conv), ['Expired worker','After failure'])
+    })
+    await scenario('legacy chats remain readable and do not dispatch old history', async () => {
+      const before = captured.length
+      assert.equal((await read(legacy)).protocol_version, 1)
+      assert.equal((await read(legacy)).can_send, false)
+      assert.equal((await send(legacy)).status, 409)
+      assert.equal(captured.length, before)
+    })
+    await scenario('lab updates are acknowledged only after success; retries keep the snapshot', async () => {
+      const conv = await create()
+      await accepted(await send(conv))
+      await query("UPDATE public.labs SET instructions='Updated prompt' WHERE id=$1", [lab])
+      const key = randomUUID(), input = { message: 'Updated?', current_code: null }
+      tutorBehavior = () => Response.json({}, { status: 503 })
+      assert.equal((await send(conv, input, key)).status, 503)
+      assert.equal(captured.at(-1).lab_context.instructions, 'Updated prompt')
+      const frozen = captured.at(-1)
+      await query("UPDATE public.labs SET instructions='Prompt' WHERE id=$1", [lab])
+      tutorBehavior = undefined
+      await accepted(await send(conv, input, key))
+      assert.deepEqual(captured.at(-1), frozen)
+      await accepted(await send(conv, { message: 'Reverted?', current_code: null }))
+      assert.equal(captured.at(-1).lab_context.instructions, 'Prompt')
+      const failedKey = randomUUID()
+      tutorBehavior = () => Response.json({}, { status: 429 })
+      assert.equal((await send(conv, input, failedKey)).status, 429)
+      tutorBehavior = undefined
+      await accepted(await send(conv, { message: 'Later turn', current_code: null }))
+      assert.equal((await send(conv, input, failedKey)).status, 409)
+    })
+    await scenario('lost AI responses recover by turn ID with no duplicate remote history', async () => {
+      const conv = await create(), before = modelCalls
+      loseAIResponse = true
+      assert.equal((await send(conv)).status, 502)
+      const history = await read(conv)
+      assert.equal(history.can_send, false)
+      const turnId = history.blocking_turn_id
+      assert.ok(turnId)
+      assert.equal((await send(conv)).status, 409)
+      assert.equal((await recover(conv, turnId, second)).status, 404)
+      const reply = await accepted(await recover(conv, turnId))
+      assert.equal(reply.turn_id, turnId)
+      assert.equal(modelCalls, before + 1)
+      assert.equal(remoteHistory.get(conv).length, 1)
+      assert.equal((await read(conv)).can_send, true)
+      assert.deepEqual(await accepted(await recover(conv, turnId)), reply)
+    })
+    await scenario('cleanup is authorized, retryable, and deletes content only after remote success', async () => {
+      const conv = await create()
+      await accepted(await send(conv))
+      assert.equal((await remove(conv, second)).status, 404)
+      assert.equal((await remove(conv, teacher)).status, 403)
+      await assert.rejects(query('DELETE FROM public.chat_messages WHERE conversation_id=$1', [conv]), { code: '23514' })
+      let startedResolve, release
+      const started = new Promise((resolve) => { startedResolve = resolve })
+      deleteBehavior = async () => {
+        startedResolve(); await new Promise((resolve) => { release = resolve })
+        return Response.json({}, { status: 503 })
+      }
+      const pendingDelete = remove(conv)
+      await started
+      try {
+        assert.equal((await remove(conv)).status, 409)
+        assert.equal((await send(conv)).status, 409)
+      } finally { release() }
+      assert.equal((await pendingDelete).status, 503)
+      assert.equal((await send(conv)).status, 409)
+      assert.equal((await messages.GET(request(student), params(conv))).status, 409)
+      assert.equal((await query('SELECT count(*)::int AS count FROM public.chat_messages WHERE conversation_id=$1', [conv])).rows[0].count, 2)
+      deleteBehavior = undefined
+      failCleanupSave = true
+      assert.equal((await remove(conv)).status, 500)
+      assert.equal(remoteHistory.has(conv), false)
+      const result = await accepted(await remove(conv))
+      assert.equal(result.deleted, true)
+      assert.equal((await query('SELECT count(*)::int AS count FROM public.chat_messages WHERE conversation_id=$1', [conv])).rows[0].count, 0)
+      assert.equal((await query('SELECT count(*)::int AS count FROM public.chat_turns WHERE conversation_id=$1', [conv])).rows[0].count, 0)
+      assert.equal((await query('SELECT count(*)::int AS count FROM public.chat_dispatches WHERE student_id=$1', [student])).rows[0].count, 1)
+      const before = remoteDeletes.length
+      assert.deepEqual(await accepted(await remove(conv)), result)
+      assert.equal(remoteDeletes.length, before)
+      assert.equal((await messages.GET(request(student), params(conv))).status, 404)
+      assert.notEqual(await create(), conv)
     })
     await scenario('database rate limits span conversations; revoked enrollment blocks replay', async () => {
       const conv = await create(), key = randomUUID(), input = { message: 'Rate check', current_code: null }
