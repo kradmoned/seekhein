@@ -136,16 +136,26 @@ cd seekhein/ai-server
 uv sync
 ```
 
-This installs the dependencies specified in `pyproject.toml` and `uv.lock`.
+This installs the lightweight API/agent dependencies specified in `pyproject.toml` and `uv.lock`. To also install the optional local RAG dependencies (`chromadb`, `pymupdf`, `sentence-transformers`), run:
+
+```bash
+uv sync --extra rag
+```
 
 ### Configure Environment Variables
 
 Create a `.env` file in the `ai-server/` directory for local development:
 
 ```env
-OPENROUTER\_API\_KEY=your\_openrouter\_api\_key
-OPENROUTER\_MODEL=your\_model\_name
+OPENROUTER_API_KEY=your_openrouter_api_key
+OPENROUTER_MODEL=your_model_name
+ENABLE_RAG=false
+SESSION_DB_PATH=./data/sessions.db
+MAX_HISTORY_TURNS=6
 ```
+
+`ENABLE_RAG` defaults to `false`; set it to `true` only when the optional RAG dependencies are installed and lab materials are indexed.
+`SESSION_DB_PATH` configures the SQLite file used to persist conversation history, pinned `lab_context`, and idempotency keys (`./data/sessions.db` by default). `MAX_HISTORY_TURNS` caps how many recent turns are sent to OpenRouter per request (`6` by default).
 
 Do not commit `.env` or expose API keys in source code.
 
@@ -172,6 +182,7 @@ http://127.0.0.1:8000
 |`/health`|Health check|
 |`/docs`|Interactive Swagger API documentation|
 |`/openapi.json`|OpenAPI specification|
+|`DELETE /api/v1/sessions/{conversation_id}`|Delete a stored conversation session and its pinned lab context|
 
 ## 6\. API Integration
 
@@ -181,15 +192,17 @@ http://127.0.0.1:8000
 POST /api/v1/tutor
 ```
 
-The endpoint receives student input and execution context from the main Seekhein backend.
+The endpoint receives the student's current message, optional `lab_context` (pinned per `conversation_id`), code, and execution feedback from the main Seekhein backend.
 
 ### Request Fields
 
 |Field|Description|
 |-|-|
-|`conversation\_id`|Conversation identifier, returned with the response|
+|`conversation\_id`|Conversation identifier, echoed in the response and used to look up/persist server-side history and pinned `lab_context`|
+|`idempotency\_key`|Optional deduplication key (also accepted via `Idempotency-Key` header) to safely return cached replies on retries|
 |`message`|Current student message|
-|`recent\_messages`|Recent conversation history supplied by the backend|
+|`lab\_context`|Optional object (`title`, `instructions`, `starter_code`/`starter`, `tests`, `reference_solution`/`solution`) pinned in SQLite and injected outside the history window|
+|`recent\_messages`|Legacy optional field; ignored because `ai-server` manages conversation history in SQLite|
 |`current\_code`|Current code in the editor|
 |`executed\_code`|Code that was executed by the student|
 |`output\_error`|Program output or error information|
@@ -199,10 +212,10 @@ Fields that are not available in a particular interaction may be empty or null, 
 
 ### Important Integration Notes
 
-* The backend is responsible for supplying conversation history through `recent\_messages`.
-* The AI Server does not independently maintain the complete conversation history.
-* `conversation\_id` is returned for conversation association; it is not used as a substitute for the supplied history.
-* `validation\_feedback` should contain the complete code-runner response in the agreed `view=tutor` format.
+* `ai-server` stores conversation history and pinned `lab_context` in SQLite keyed by `conversation_id` (sending the last `MAX_HISTORY_TURNS` turns to the LLM while keeping `lab_context` pinned).
+* The backend only needs to send `conversation_id`, the current `message`, `lab_context` (on turn 1 or when updated), and current code/execution feedback; `recent_messages` can be omitted or `[]`.
+* Supply an `idempotency_key` (or `Idempotency-Key` header) per turn so retries return the stored answer without duplicating history.
+* `validation_feedback` should contain the complete code-runner response in the agreed `view=tutor` format.
 * The AI Server sanitizes and extracts relevant execution information internally.
 * The AI Server is responsible for interpreting the supplied context and generating the tutoring response.
 

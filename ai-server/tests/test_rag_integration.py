@@ -6,7 +6,9 @@ import pytest
 from agent.rag_integration import retrieve_context
 
 
-def test_retrieve_context():
+def test_retrieve_context(monkeypatch):
+
+    monkeypatch.setenv("ENABLE_RAG", "true")
 
     mock_result = {
         "context": ["Retrieved programming concept."],
@@ -32,6 +34,16 @@ def test_retrieve_context():
         task_id="dynamic_task",
         top_k=3,
     )
+
+
+def test_retrieve_context_disabled_by_default(monkeypatch):
+
+    monkeypatch.delenv("ENABLE_RAG", raising=False)
+
+    assert retrieve_context("Explain loops") == {
+        "context": [],
+        "sources": [],
+    }
 
 
 def test_empty_question():
